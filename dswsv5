@@ -1,0 +1,2545 @@
+// ==UserScript==
+// @name         中英互译 + 英语长难句分析 Pro
+// @namespace    tampermonkey-cn-en-translator
+// @version      2.0.0
+// @description  可移动悬浮球 + 中英互译 + 英语长难句分析
+// @match        http://*/*
+// @match        https://*/*
+// @grant        GM_xmlhttpRequest
+// @grant        GM_getValue
+// @grant        GM_setValue
+// @connect      api.openclawplan.com
+// @run-at       document-idle
+// ==/UserScript==
+
+(() => {
+    'use strict';
+
+    // =========================================================
+    // 基础配置
+    // =========================================================
+
+    const DEFAULT_BASE_URL =
+        'https://api.openclawplan.com/v1';
+
+    const DEFAULT_MODEL =
+        'gpt-5.6-terra';
+
+    let currentText = '';
+    let lastResult = '';
+    let hideTimer = null;
+
+    function getConfig() {
+        return {
+            apiKey:
+                GM_getValue(
+                    'translator_api_key',
+                    ''
+                ),
+
+            baseUrl:
+                GM_getValue(
+                    'translator_base_url',
+                    DEFAULT_BASE_URL
+                ),
+
+            model:
+                GM_getValue(
+                    'translator_model',
+                    DEFAULT_MODEL
+                )
+        };
+    }
+
+    function saveConfig(
+        apiKey,
+        baseUrl,
+        model
+    ) {
+        GM_setValue(
+            'translator_api_key',
+            apiKey.trim()
+        );
+
+        GM_setValue(
+            'translator_base_url',
+            (
+                baseUrl.trim() ||
+                DEFAULT_BASE_URL
+            ).replace(/\/+$/, '')
+        );
+
+        GM_setValue(
+            'translator_model',
+            model.trim() ||
+            DEFAULT_MODEL
+        );
+    }
+
+    // =========================================================
+    // 语言判断
+    // =========================================================
+
+    function detectLanguage(text) {
+        const zhCount =
+            (
+                text.match(
+                    /[\u4e00-\u9fff]/g
+                ) || []
+            ).length;
+
+        const enCount =
+            (
+                text.match(
+                    /[A-Za-z]/g
+                ) || []
+            ).length;
+
+        if (
+            zhCount === 0 &&
+            enCount === 0
+        ) {
+            return 'unknown';
+        }
+
+        if (
+            zhCount > 0 &&
+            enCount === 0
+        ) {
+            return 'zh';
+        }
+
+        if (
+            enCount > 0 &&
+            zhCount === 0
+        ) {
+            return 'en';
+        }
+
+        const total =
+            zhCount + enCount;
+
+        if (
+            zhCount / total >= 0.6
+        ) {
+            return 'zh';
+        }
+
+        if (
+            enCount / total >= 0.6
+        ) {
+            return 'en';
+        }
+
+        return 'mixed';
+    }
+
+    // =========================================================
+    // 获取选中文字
+    // =========================================================
+
+    function getSelectedText() {
+        const active =
+            document.activeElement;
+
+        if (
+            active &&
+            (
+                active.tagName ===
+                    'TEXTAREA' ||
+                active.tagName ===
+                    'INPUT'
+            )
+        ) {
+            const start =
+                active.selectionStart;
+
+            const end =
+                active.selectionEnd;
+
+            if (
+                typeof start ===
+                    'number' &&
+                typeof end ===
+                    'number' &&
+                end > start
+            ) {
+                return active.value
+                    .slice(
+                        start,
+                        end
+                    )
+                    .trim();
+            }
+        }
+
+        return window
+            .getSelection()
+            .toString()
+            .trim();
+    }
+
+    // =========================================================
+    // API 输出解析
+    // =========================================================
+
+    function extractOutput(data) {
+        if (!data) {
+            return '';
+        }
+
+        if (
+            typeof data.output_text ===
+            'string'
+        ) {
+            return data.output_text.trim();
+        }
+
+        if (
+            Array.isArray(
+                data.output
+            )
+        ) {
+            const result = [];
+
+            for (
+                const item
+                of data.output
+            ) {
+                if (
+                    !Array.isArray(
+                        item.content
+                    )
+                ) {
+                    continue;
+                }
+
+                for (
+                    const content
+                    of item.content
+                ) {
+                    if (
+                        typeof content.text ===
+                        'string'
+                    ) {
+                        result.push(
+                            content.text
+                        );
+                    }
+
+                    else if (
+                        content.text &&
+                        typeof
+                            content.text.value ===
+                            'string'
+                    ) {
+                        result.push(
+                            content.text.value
+                        );
+                    }
+                }
+            }
+
+            return result
+                .join('\n')
+                .trim();
+        }
+
+        return '';
+    }
+
+    // =========================================================
+    // API 请求
+    // =========================================================
+
+    function requestAPI(prompt) {
+        const config =
+            getConfig();
+
+        return new Promise(
+            (
+                resolve,
+                reject
+            ) => {
+
+                if (
+                    !config.apiKey
+                ) {
+                    reject(
+                        new Error(
+                            '请先点击设置按钮填写 API Key。'
+                        )
+                    );
+                    return;
+                }
+
+                const url =
+                    config.baseUrl
+                        .replace(
+                            /\/+$/,
+                            ''
+                        ) +
+                    '/responses';
+
+                GM_xmlhttpRequest({
+                    method:
+                        'POST',
+
+                    url,
+
+                    headers: {
+                        'Content-Type':
+                            'application/json',
+
+                        'Authorization':
+                            'Bearer ' +
+                            config.apiKey
+                    },
+
+                    data:
+                        JSON.stringify({
+                            model:
+                                config.model,
+
+                            reasoning: {
+                                effort:
+                                    'low'
+                            },
+
+                            store:
+                                false,
+
+                            input:
+                                prompt
+                        }),
+
+                    timeout:
+                        60000,
+
+                    onload(
+                        response
+                    ) {
+                        let data;
+
+                        try {
+                            data =
+                                JSON.parse(
+                                    response
+                                        .responseText
+                                );
+                        }
+                        catch {
+                            reject(
+                                new Error(
+                                    'API 返回内容不是有效 JSON。'
+                                )
+                            );
+                            return;
+                        }
+
+                        if (
+                            response.status <
+                                200 ||
+                            response.status >=
+                                300
+                        ) {
+                            const message =
+                                data?.error
+                                    ?.message ||
+                                data?.message ||
+                                'HTTP ' +
+                                    response
+                                        .status;
+
+                            reject(
+                                new Error(
+                                    message
+                                )
+                            );
+
+                            return;
+                        }
+
+                        const output =
+                            extractOutput(
+                                data
+                            );
+
+                        if (!output) {
+                            reject(
+                                new Error(
+                                    'API 返回成功，但没有找到文本结果。'
+                                )
+                            );
+
+                            return;
+                        }
+
+                        resolve(
+                            output
+                        );
+                    },
+
+                    onerror() {
+                        reject(
+                            new Error(
+                                '网络请求失败。'
+                            )
+                        );
+                    },
+
+                    ontimeout() {
+                        reject(
+                            new Error(
+                                'API 请求超时。'
+                            )
+                        );
+                    }
+                });
+            }
+        );
+    }
+
+    // =========================================================
+    // 翻译 Prompt
+    // =========================================================
+
+    function createTranslatePrompt(
+        text,
+        lang
+    ) {
+        if (
+            lang === 'zh'
+        ) {
+            return `
+You are a professional Chinese-English translator.
+
+Translate the following Chinese text into natural, accurate and fluent English.
+
+Requirements:
+
+1. Preserve the original meaning.
+2. Preserve important terminology.
+3. Make the English natural.
+4. Do not explain.
+5. Do not analyze grammar.
+6. Do not add notes.
+7. Return only the translation.
+
+Chinese text:
+
+${text}
+`.trim();
+        }
+
+        return `
+You are a professional English-Chinese translator.
+
+Translate the following English text into natural and accurate Simplified Chinese.
+
+Requirements:
+
+1. Preserve the original meaning.
+2. Preserve terminology, names and numbers.
+3. Make the Chinese natural and fluent.
+4. Do not explain.
+5. Do not analyze grammar.
+6. Do not add notes.
+7. Return only the translation.
+
+English text:
+
+${text}
+`.trim();
+    }
+
+    // =========================================================
+    // 长难句 Prompt
+    // =========================================================
+
+    function createAnalysisPrompt(
+        text
+    ) {
+        return `
+你是一名专业的英语语法教师，
+主要帮助中国学生理解英语长难句。
+
+请详细分析下面的英文句子。
+
+严格按照下面格式回答：
+
+【一、句子主干】
+
+找出：
+
+主语：
+谓语：
+宾语：
+表语：
+
+如果某个成分不存在，可以省略。
+
+然后给出最核心的句子骨架。
+
+【二、结构拆分】
+
+按照由外到内的顺序，
+逐层拆解整个句子。
+
+包括：
+
+- 主句
+- 定语从句
+- 名词性从句
+- 状语从句
+- 同位语从句
+- 非谓语结构
+- 插入结构
+
+并说明每部分在句中的作用。
+
+【三、修饰关系】
+
+说明：
+
+- 哪些词修饰哪些成分
+- 介词短语修饰什么
+- 分词结构修饰什么
+- 不定式修饰什么
+- 定语从句先行词是什么
+- 代词具体指代什么
+
+【四、重点词组】
+
+解释句中的：
+
+- 固定搭配
+- 高频表达
+- 重要词义
+- 容易误解的短语
+
+【五、理解难点】
+
+说明为什么这个句子比较难理解，
+指出最容易造成误判的语法结构。
+
+【六、自然翻译】
+
+给出自然、准确、符合中文表达习惯的
+简体中文翻译。
+
+要求：
+
+1. 所有分析必须针对原句。
+2. 不要编造不存在的语法结构。
+3. 尽量通俗易懂。
+4. 重点帮助英语学习者理解句子结构。
+
+英文原句：
+
+${text}
+`.trim();
+    }
+
+    // =========================================================
+    // CSS
+    // =========================================================
+
+    const style =
+        document.createElement(
+            'style'
+        );
+
+    style.textContent = `
+
+/* ================================
+   整体容器
+================================ */
+
+#ai-translator-container {
+    position: fixed;
+
+    z-index: 2147483647;
+
+    width: 58px;
+    height: 58px;
+
+    font-family:
+        -apple-system,
+        BlinkMacSystemFont,
+        "Segoe UI",
+        "PingFang SC",
+        "Microsoft YaHei",
+        sans-serif;
+
+    color: #1f2937;
+
+    user-select: none;
+}
+
+
+/* ================================
+   悬浮球
+================================ */
+
+#ai-translator-ball {
+    width: 58px;
+    height: 58px;
+
+    border-radius: 50%;
+
+    display: flex;
+
+    align-items: center;
+    justify-content: center;
+
+    cursor: grab;
+
+    position: absolute;
+
+    right: 0;
+    top: 0;
+
+    background:
+        linear-gradient(
+            135deg,
+            #667eea 0%,
+            #764ba2 45%,
+            #ec4899 100%
+        );
+
+    box-shadow:
+        0 8px 25px
+        rgba(102,126,234,.42);
+
+    transition:
+        transform .25s ease,
+        box-shadow .25s ease;
+
+    border:
+        2px solid
+        rgba(255,255,255,.75);
+}
+
+#ai-translator-ball:hover {
+    transform:
+        scale(1.08);
+
+    box-shadow:
+        0 10px 35px
+        rgba(118,75,162,.55);
+}
+
+#ai-translator-ball:active {
+    cursor: grabbing;
+}
+
+.ai-ball-inner {
+    width: 46px;
+    height: 46px;
+
+    border-radius: 50%;
+
+    background:
+        rgba(
+            255,
+            255,
+            255,
+            .14
+        );
+
+    backdrop-filter:
+        blur(8px);
+
+    display: flex;
+
+    flex-direction: column;
+
+    justify-content: center;
+    align-items: center;
+
+    color: white;
+
+    font-weight: 800;
+
+    line-height: 1;
+}
+
+.ai-ball-main {
+    font-size: 17px;
+}
+
+.ai-ball-sub {
+    font-size: 8px;
+
+    margin-top: 3px;
+
+    opacity: .8;
+
+    letter-spacing: 1px;
+}
+
+
+/* ================================
+   主面板
+================================ */
+
+#ai-translator-panel {
+    position: absolute;
+
+    width: 420px;
+
+    height: 50vh;
+
+    min-height: 360px;
+
+    max-height: 560px;
+
+    right: 68px;
+
+    top: 0;
+
+    background:
+        rgba(
+            255,
+            255,
+            255,
+            .97
+        );
+
+    backdrop-filter:
+        blur(22px);
+
+    border:
+        1px solid
+        rgba(
+            148,
+            163,
+            184,
+            .28
+        );
+
+    border-radius: 18px;
+
+    box-shadow:
+        0 20px 60px
+        rgba(
+            15,
+            23,
+            42,
+            .20
+        );
+
+    overflow: hidden;
+
+    display: flex;
+
+    flex-direction: column;
+
+    opacity: 0;
+
+    visibility: hidden;
+
+    transform:
+        translateX(12px)
+        scale(.97);
+
+    transform-origin:
+        right top;
+
+    transition:
+        opacity .22s ease,
+        transform .22s ease,
+        visibility .22s;
+
+    pointer-events: none;
+
+    user-select: text;
+}
+
+#ai-translator-container.ai-open
+#ai-translator-panel {
+
+    opacity: 1;
+
+    visibility: visible;
+
+    transform:
+        translateX(0)
+        scale(1);
+
+    pointer-events: auto;
+}
+
+
+/* ================================
+   顶部
+================================ */
+
+.ai-header {
+    height: 60px;
+
+    min-height: 60px;
+
+    padding:
+        0 15px;
+
+    display: flex;
+
+    align-items: center;
+
+    background:
+        linear-gradient(
+            120deg,
+            rgba(
+                99,
+                102,
+                241,
+                .10
+            ),
+            rgba(
+                168,
+                85,
+                247,
+                .08
+            ),
+            rgba(
+                236,
+                72,
+                153,
+                .08
+            )
+        );
+
+    border-bottom:
+        1px solid
+        #eef2f7;
+}
+
+.ai-logo {
+    width: 36px;
+    height: 36px;
+
+    border-radius:
+        11px;
+
+    display: flex;
+
+    align-items: center;
+    justify-content: center;
+
+    margin-right:
+        10px;
+
+    color: white;
+
+    font-weight:
+        800;
+
+    background:
+        linear-gradient(
+            135deg,
+            #6366f1,
+            #8b5cf6
+        );
+
+    box-shadow:
+        0 5px 14px
+        rgba(
+            99,
+            102,
+            241,
+            .25
+        );
+}
+
+.ai-header-text {
+    flex: 1;
+}
+
+.ai-title {
+    font-size:
+        15px;
+
+    font-weight:
+        750;
+
+    color:
+        #111827;
+}
+
+.ai-subtitle {
+    font-size:
+        10px;
+
+    color:
+        #94a3b8;
+
+    margin-top:
+        2px;
+}
+
+
+/* ================================
+   通用按钮
+================================ */
+
+#ai-translator-panel button {
+
+    border: 0;
+
+    border-radius:
+        9px;
+
+    padding:
+        7px 11px;
+
+    cursor:
+        pointer;
+
+    font-size:
+        12px;
+
+    font-weight:
+        600;
+
+    transition:
+        transform .16s ease,
+        filter .16s ease,
+        box-shadow .16s ease;
+}
+
+#ai-translator-panel button:hover {
+
+    transform:
+        translateY(-1px);
+
+    filter:
+        brightness(.98);
+}
+
+
+/* 设置按钮 */
+
+.ai-settings-btn {
+
+    color:
+        #475569;
+
+    background:
+        rgba(
+            255,
+            255,
+            255,
+            .8
+        );
+
+    border:
+        1px solid
+        #e2e8f0 !important;
+}
+
+
+/* ================================
+   工具栏
+================================ */
+
+.ai-toolbar {
+
+    padding:
+        10px 12px;
+
+    display: grid;
+
+    grid-template-columns:
+        1.25fr
+        1.25fr
+        .8fr
+        .65fr;
+
+    gap:
+        7px;
+
+    background:
+        #fafbff;
+
+    border-bottom:
+        1px solid
+        #edf0f7;
+}
+
+.ai-btn-translate {
+
+    color: white;
+
+    background:
+        linear-gradient(
+            135deg,
+            #3b82f6,
+            #6366f1
+        );
+
+    box-shadow:
+        0 4px 12px
+        rgba(
+            59,
+            130,
+            246,
+            .20
+        );
+}
+
+.ai-btn-analysis {
+
+    color: white;
+
+    background:
+        linear-gradient(
+            135deg,
+            #8b5cf6,
+            #a855f7
+        );
+
+    box-shadow:
+        0 4px 12px
+        rgba(
+            139,
+            92,
+            246,
+            .20
+        );
+}
+
+.ai-btn-copy {
+
+    color:
+        #047857;
+
+    background:
+        #ecfdf5;
+}
+
+.ai-btn-clear {
+
+    color:
+        #be123c;
+
+    background:
+        #fff1f2;
+}
+
+
+/* ================================
+   内容区
+================================ */
+
+#ai-content {
+
+    flex: 1;
+
+    overflow-y: auto;
+
+    padding:
+        12px;
+
+    background:
+        linear-gradient(
+            180deg,
+            #ffffff,
+            #fafbff
+        );
+}
+
+#ai-content::-webkit-scrollbar {
+
+    width: 6px;
+}
+
+#ai-content::-webkit-scrollbar-thumb {
+
+    background:
+        #cbd5e1;
+
+    border-radius:
+        10px;
+}
+
+.ai-card {
+
+    position: relative;
+
+    border:
+        1px solid
+        #e8ebf3;
+
+    border-radius:
+        13px;
+
+    padding:
+        11px 12px;
+
+    margin-bottom:
+        10px;
+
+    background:
+        rgba(
+            255,
+            255,
+            255,
+            .94
+        );
+
+    box-shadow:
+        0 3px 10px
+        rgba(
+            15,
+            23,
+            42,
+            .035
+        );
+}
+
+.ai-card-original {
+
+    border-left:
+        4px solid
+        #3b82f6;
+}
+
+.ai-card-result {
+
+    border-left:
+        4px solid
+        #8b5cf6;
+}
+
+.ai-label {
+
+    display: flex;
+
+    align-items:
+        center;
+
+    gap: 6px;
+
+    margin-bottom:
+        7px;
+
+    font-size:
+        11px;
+
+    font-weight:
+        750;
+
+    color:
+        #64748b;
+
+    text-transform:
+        uppercase;
+
+    letter-spacing:
+        .4px;
+}
+
+.ai-dot {
+
+    width: 7px;
+    height: 7px;
+
+    border-radius:
+        50%;
+}
+
+.ai-dot-blue {
+
+    background:
+        #3b82f6;
+
+    box-shadow:
+        0 0 0
+        3px
+        #dbeafe;
+}
+
+.ai-dot-purple {
+
+    background:
+        #8b5cf6;
+
+    box-shadow:
+        0 0 0
+        3px
+        #ede9fe;
+}
+
+.ai-text {
+
+    white-space:
+        pre-wrap;
+
+    word-break:
+        break-word;
+
+    line-height:
+        1.7;
+
+    font-size:
+        13.5px;
+
+    color:
+        #334155;
+}
+
+
+/* ================================
+   状态栏
+================================ */
+
+#ai-status {
+
+    min-height:
+        33px;
+
+    padding:
+        8px 12px;
+
+    font-size:
+        11px;
+
+    color:
+        #64748b;
+
+    border-top:
+        1px solid
+        #edf0f7;
+
+    background:
+        #f8fafc;
+
+    display:
+        flex;
+
+    align-items:
+        center;
+}
+
+.ai-status-dot {
+
+    width: 7px;
+
+    height: 7px;
+
+    border-radius:
+        50%;
+
+    background:
+        #22c55e;
+
+    margin-right:
+        7px;
+
+    box-shadow:
+        0 0 0
+        3px
+        #dcfce7;
+}
+
+
+/* ================================
+   API 设置弹窗
+================================ */
+
+#ai-settings {
+
+    position:
+        absolute;
+
+    top:
+        68px;
+
+    left:
+        14px;
+
+    right:
+        14px;
+
+    z-index:
+        50;
+
+    padding:
+        15px;
+
+    border-radius:
+        15px;
+
+    background:
+        rgba(
+            255,
+            255,
+            255,
+            .985
+        );
+
+    border:
+        1px solid
+        #e2e8f0;
+
+    box-shadow:
+        0 15px 40px
+        rgba(
+            15,
+            23,
+            42,
+            .18
+        );
+
+    display:
+        none;
+}
+
+.ai-setting-title {
+
+    font-size:
+        14px;
+
+    font-weight:
+        750;
+
+    margin-bottom:
+        13px;
+
+    color:
+        #1e293b;
+}
+
+#ai-settings label {
+
+    display:
+        block;
+
+    font-size:
+        11px;
+
+    color:
+        #64748b;
+
+    font-weight:
+        650;
+
+    margin-top:
+        8px;
+
+    margin-bottom:
+        4px;
+}
+
+#ai-settings input {
+
+    width:
+        100%;
+
+    box-sizing:
+        border-box;
+
+    padding:
+        8px 10px;
+
+    border-radius:
+        8px;
+
+    border:
+        1px solid
+        #dbe2ea;
+
+    outline:
+        none;
+
+    font-size:
+        12px;
+
+    transition:
+        border .2s,
+        box-shadow .2s;
+}
+
+#ai-settings input:focus {
+
+    border-color:
+        #818cf8;
+
+    box-shadow:
+        0 0 0
+        3px
+        rgba(
+            99,
+            102,
+            241,
+            .10
+        );
+}
+
+.ai-setting-actions {
+
+    display:
+        flex;
+
+    justify-content:
+        flex-end;
+
+    gap:
+        7px;
+
+    margin-top:
+        13px;
+}
+
+.ai-save {
+
+    background:
+        linear-gradient(
+            135deg,
+            #6366f1,
+            #8b5cf6
+        );
+
+    color:
+        white;
+}
+
+.ai-cancel {
+
+    background:
+        #f1f5f9;
+
+    color:
+        #475569;
+}
+
+`;
+
+    document.head
+        .appendChild(style);
+
+    // =========================================================
+    // 主体 HTML
+    // =========================================================
+
+    const container =
+        document.createElement(
+            'div'
+        );
+
+    container.id =
+        'ai-translator-container';
+
+    container.innerHTML = `
+
+<div id="ai-translator-panel">
+
+    <div class="ai-header">
+
+        <div class="ai-logo">
+            A
+        </div>
+
+        <div class="ai-header-text">
+
+            <div class="ai-title">
+                中英智能助手
+            </div>
+
+            <div class="ai-subtitle">
+                TRANSLATION · SENTENCE ANALYSIS
+            </div>
+
+        </div>
+
+        <button
+            class="ai-settings-btn"
+            id="ai-settings-btn"
+        >
+            ⚙ 设置
+        </button>
+
+    </div>
+
+
+    <div class="ai-toolbar">
+
+        <button
+            class="ai-btn-translate"
+            id="ai-translate"
+        >
+            ✦ 翻译
+        </button>
+
+        <button
+            class="ai-btn-analysis"
+            id="ai-analysis"
+        >
+            ◈ 长难句
+        </button>
+
+        <button
+            class="ai-btn-copy"
+            id="ai-copy"
+        >
+            ⧉ 复制
+        </button>
+
+        <button
+            class="ai-btn-clear"
+            id="ai-clear"
+        >
+            清空
+        </button>
+
+    </div>
+
+
+    <div id="ai-content">
+
+        <div class="ai-card">
+
+            <div class="ai-label">
+
+                <span
+                    class="ai-dot
+                    ai-dot-purple"
+                ></span>
+
+                使用说明
+
+            </div>
+
+            <div class="ai-text">
+选中中文或英文，按 Alt + T 即可翻译。
+
+中文 → 英文
+英文 → 中文
+
+选中英文后点击“长难句”，可以进行语法结构分析。
+            </div>
+
+        </div>
+
+    </div>
+
+
+    <div id="ai-status">
+
+        <span
+            class="ai-status-dot"
+        ></span>
+
+        <span id="ai-status-text">
+            准备就绪
+        </span>
+
+    </div>
+
+
+    <div id="ai-settings">
+
+        <div class="ai-setting-title">
+            ⚙ API 设置
+        </div>
+
+        <label>
+            API Key
+        </label>
+
+        <input
+            id="ai-api-key"
+            type="password"
+            placeholder="请输入 API Key"
+        >
+
+
+        <label>
+            Base URL
+        </label>
+
+        <input
+            id="ai-base-url"
+            type="text"
+        >
+
+
+        <label>
+            模型
+        </label>
+
+        <input
+            id="ai-model"
+            type="text"
+        >
+
+
+        <div
+            class="ai-setting-actions"
+        >
+
+            <button
+                class="ai-cancel"
+                id="ai-cancel"
+            >
+                取消
+            </button>
+
+            <button
+                class="ai-save"
+                id="ai-save"
+            >
+                保存设置
+            </button>
+
+        </div>
+
+    </div>
+
+</div>
+
+
+<div id="ai-translator-ball">
+
+    <div class="ai-ball-inner">
+
+        <div class="ai-ball-main">
+            A译
+        </div>
+
+        <div class="ai-ball-sub">
+            AI
+        </div>
+
+    </div>
+
+</div>
+`;
+
+    document.body
+        .appendChild(
+            container
+        );
+
+    // =========================================================
+    // 元素
+    // =========================================================
+
+    const ball =
+        document.getElementById(
+            'ai-translator-ball'
+        );
+
+    const panel =
+        document.getElementById(
+            'ai-translator-panel'
+        );
+
+    const content =
+        document.getElementById(
+            'ai-content'
+        );
+
+    const statusText =
+        document.getElementById(
+            'ai-status-text'
+        );
+
+    const settingsPanel =
+        document.getElementById(
+            'ai-settings'
+        );
+
+    // =========================================================
+    // 初始悬浮球位置
+    // =========================================================
+
+    const savedX =
+        GM_getValue(
+            'translator_ball_x',
+            window.innerWidth - 90
+        );
+
+    const savedY =
+        GM_getValue(
+            'translator_ball_y',
+            Math.round(
+                window.innerHeight *
+                0.35
+            )
+        );
+
+    function setContainerPosition(
+        x,
+        y
+    ) {
+        const maxX =
+            window.innerWidth - 58;
+
+        const maxY =
+            window.innerHeight - 58;
+
+        x =
+            Math.max(
+                0,
+                Math.min(
+                    x,
+                    maxX
+                )
+            );
+
+        y =
+            Math.max(
+                0,
+                Math.min(
+                    y,
+                    maxY
+                )
+            );
+
+        container.style.left =
+            x + 'px';
+
+        container.style.top =
+            y + 'px';
+
+        container.style.right =
+            'auto';
+
+        return {
+            x,
+            y
+        };
+    }
+
+    setContainerPosition(
+        savedX,
+        savedY
+    );
+
+    // =========================================================
+    // 自动决定面板向左还是向右展开
+    // =========================================================
+
+    function updatePanelDirection() {
+        const rect =
+            ball.getBoundingClientRect();
+
+        const panelWidth =
+            420;
+
+        if (
+            rect.left >
+            panelWidth + 30
+        ) {
+            panel.style.right =
+                '68px';
+
+            panel.style.left =
+                'auto';
+        }
+
+        else {
+            panel.style.left =
+                '68px';
+
+            panel.style.right =
+                'auto';
+        }
+
+        const panelHeight =
+            Math.min(
+                window.innerHeight *
+                    0.5,
+                560
+            );
+
+        if (
+            rect.top +
+                panelHeight >
+            window.innerHeight
+        ) {
+            panel.style.top =
+                'auto';
+
+            panel.style.bottom =
+                '0';
+        }
+
+        else {
+            panel.style.top =
+                '0';
+
+            panel.style.bottom =
+                'auto';
+        }
+    }
+
+    // =========================================================
+    // 悬浮球 hover
+    // =========================================================
+
+    function openPanel() {
+        clearTimeout(
+            hideTimer
+        );
+
+        updatePanelDirection();
+
+        container
+            .classList
+            .add(
+                'ai-open'
+            );
+    }
+
+    function scheduleClose() {
+        clearTimeout(
+            hideTimer
+        );
+
+        hideTimer =
+            setTimeout(
+                () => {
+
+                    if (
+                        settingsPanel
+                            .style
+                            .display ===
+                        'block'
+                    ) {
+                        return;
+                    }
+
+                    container
+                        .classList
+                        .remove(
+                            'ai-open'
+                        );
+
+                },
+                280
+            );
+    }
+
+    ball.addEventListener(
+        'mouseenter',
+        openPanel
+    );
+
+    ball.addEventListener(
+        'mouseleave',
+        scheduleClose
+    );
+
+    panel.addEventListener(
+        'mouseenter',
+        openPanel
+    );
+
+    panel.addEventListener(
+        'mouseleave',
+        scheduleClose
+    );
+
+    // =========================================================
+    // 拖动悬浮球
+    // =========================================================
+
+    let dragging =
+        false;
+
+    let startMouseX =
+        0;
+
+    let startMouseY =
+        0;
+
+    let startX =
+        0;
+
+    let startY =
+        0;
+
+    let moved =
+        false;
+
+    ball.addEventListener(
+        'mousedown',
+        e => {
+
+            if (
+                e.button !== 0
+            ) {
+                return;
+            }
+
+            dragging =
+                true;
+
+            moved =
+                false;
+
+            startMouseX =
+                e.clientX;
+
+            startMouseY =
+                e.clientY;
+
+            const rect =
+                container
+                    .getBoundingClientRect();
+
+            startX =
+                rect.left;
+
+            startY =
+                rect.top;
+
+            e.preventDefault();
+        }
+    );
+
+    document.addEventListener(
+        'mousemove',
+        e => {
+
+            if (
+                !dragging
+            ) {
+                return;
+            }
+
+            const dx =
+                e.clientX -
+                startMouseX;
+
+            const dy =
+                e.clientY -
+                startMouseY;
+
+            if (
+                Math.abs(dx) > 3 ||
+                Math.abs(dy) > 3
+            ) {
+                moved =
+                    true;
+            }
+
+            const position =
+                setContainerPosition(
+                    startX + dx,
+                    startY + dy
+                );
+
+            updatePanelDirection();
+
+            GM_setValue(
+                'translator_ball_x',
+                position.x
+            );
+
+            GM_setValue(
+                'translator_ball_y',
+                position.y
+            );
+        }
+    );
+
+    document.addEventListener(
+        'mouseup',
+        () => {
+
+            if (
+                !dragging
+            ) {
+                return;
+            }
+
+            dragging =
+                false;
+
+            ball.style.cursor =
+                'grab';
+        }
+    );
+
+    // =========================================================
+    // 状态
+    // =========================================================
+
+    function setStatus(text) {
+        statusText.textContent =
+            text;
+    }
+
+    // =========================================================
+    // 卡片显示
+    // =========================================================
+
+    function showResult(
+        original,
+        title,
+        result
+    ) {
+        lastResult =
+            result;
+
+        content.innerHTML =
+            '';
+
+        const originalCard =
+            document.createElement(
+                'div'
+            );
+
+        originalCard.className =
+            'ai-card ai-card-original';
+
+        originalCard.innerHTML = `
+
+<div class="ai-label">
+
+    <span
+        class="ai-dot
+        ai-dot-blue"
+    ></span>
+
+    原文
+
+</div>
+
+<div
+    class="ai-text"
+></div>
+`;
+
+        originalCard
+            .querySelector(
+                '.ai-text'
+            )
+            .textContent =
+                original;
+
+        const resultCard =
+            document.createElement(
+                'div'
+            );
+
+        resultCard.className =
+            'ai-card ai-card-result';
+
+        resultCard.innerHTML = `
+
+<div class="ai-label">
+
+    <span
+        class="ai-dot
+        ai-dot-purple"
+    ></span>
+
+    <span
+        class="ai-result-title"
+    ></span>
+
+</div>
+
+<div
+    class="ai-text"
+></div>
+`;
+
+        resultCard
+            .querySelector(
+                '.ai-result-title'
+            )
+            .textContent =
+                title;
+
+        resultCard
+            .querySelector(
+                '.ai-text'
+            )
+            .textContent =
+                result;
+
+        content.appendChild(
+            originalCard
+        );
+
+        content.appendChild(
+            resultCard
+        );
+    }
+
+    // =========================================================
+    // 翻译
+    // =========================================================
+
+    async function translate() {
+        const text =
+            getSelectedText();
+
+        if (!text) {
+            setStatus(
+                '请先选择中文或英文'
+            );
+
+            openPanel();
+
+            return;
+        }
+
+        currentText =
+            text;
+
+        const lang =
+            detectLanguage(
+                text
+            );
+
+        if (
+            lang !== 'zh' &&
+            lang !== 'en'
+        ) {
+            setStatus(
+                '仅支持中文和英文互译'
+            );
+
+            openPanel();
+
+            return;
+        }
+
+        openPanel();
+
+        setStatus(
+            lang === 'zh'
+                ? '正在翻译：中文 → 英文…'
+                : '正在翻译：英文 → 中文…'
+        );
+
+        content.innerHTML = `
+
+<div class="ai-card">
+
+    <div class="ai-label">
+        ✦ AI 正在思考
+    </div>
+
+    <div class="ai-text">
+        正在生成翻译结果，请稍候…
+    </div>
+
+</div>
+`;
+
+        try {
+            const result =
+                await requestAPI(
+                    createTranslatePrompt(
+                        text,
+                        lang
+                    )
+                );
+
+            showResult(
+                text,
+
+                lang === 'zh'
+                    ? '英文翻译'
+                    : '中文翻译',
+
+                result
+            );
+
+            setStatus(
+                '✓ 翻译完成'
+            );
+        }
+
+        catch (error) {
+            setStatus(
+                '错误：' +
+                error.message
+            );
+
+            content.innerHTML = `
+
+<div
+    class="ai-card
+    ai-card-result"
+>
+
+    <div class="ai-label">
+        请求失败
+    </div>
+
+    <div class="ai-text"></div>
+
+</div>
+`;
+
+            content
+                .querySelector(
+                    '.ai-text'
+                )
+                .textContent =
+                    error.message;
+        }
+    }
+
+    // =========================================================
+    // 长难句
+    // =========================================================
+
+    async function analyze() {
+        let text =
+            getSelectedText();
+
+        if (!text) {
+            text =
+                currentText;
+        }
+
+        if (!text) {
+            setStatus(
+                '请先选择英文句子'
+            );
+
+            return;
+        }
+
+        if (
+            detectLanguage(
+                text
+            ) !== 'en'
+        ) {
+            setStatus(
+                '长难句分析仅支持英文'
+            );
+
+            return;
+        }
+
+        currentText =
+            text;
+
+        openPanel();
+
+        setStatus(
+            '正在分析英语句子结构…'
+        );
+
+        content.innerHTML = `
+
+<div class="ai-card">
+
+    <div class="ai-label">
+        ◈ 长难句分析
+    </div>
+
+    <div class="ai-text">
+        正在分析主干、从句、修饰关系和重点词组…
+    </div>
+
+</div>
+`;
+
+        try {
+            const result =
+                await requestAPI(
+                    createAnalysisPrompt(
+                        text
+                    )
+                );
+
+            showResult(
+                text,
+                '长难句结构分析',
+                result
+            );
+
+            setStatus(
+                '✓ 长难句分析完成'
+            );
+        }
+
+        catch (error) {
+            setStatus(
+                '错误：' +
+                error.message
+            );
+        }
+    }
+
+    // =========================================================
+    // 设置
+    // =========================================================
+
+    document
+        .getElementById(
+            'ai-settings-btn'
+        )
+        .addEventListener(
+            'click',
+            e => {
+
+                e.stopPropagation();
+
+                const config =
+                    getConfig();
+
+                document
+                    .getElementById(
+                        'ai-api-key'
+                    )
+                    .value =
+                        config.apiKey;
+
+                document
+                    .getElementById(
+                        'ai-base-url'
+                    )
+                    .value =
+                        config.baseUrl;
+
+                document
+                    .getElementById(
+                        'ai-model'
+                    )
+                    .value =
+                        config.model;
+
+                settingsPanel
+                    .style
+                    .display =
+                        'block';
+
+                openPanel();
+            }
+        );
+
+    document
+        .getElementById(
+            'ai-cancel'
+        )
+        .addEventListener(
+            'click',
+            () => {
+
+                settingsPanel
+                    .style
+                    .display =
+                        'none';
+            }
+        );
+
+    document
+        .getElementById(
+            'ai-save'
+        )
+        .addEventListener(
+            'click',
+            () => {
+
+                const apiKey =
+                    document
+                        .getElementById(
+                            'ai-api-key'
+                        )
+                        .value;
+
+                const baseUrl =
+                    document
+                        .getElementById(
+                            'ai-base-url'
+                        )
+                        .value;
+
+                const model =
+                    document
+                        .getElementById(
+                            'ai-model'
+                        )
+                        .value;
+
+                if (
+                    !apiKey.trim()
+                ) {
+                    setStatus(
+                        'API Key 不能为空'
+                    );
+
+                    return;
+                }
+
+                saveConfig(
+                    apiKey,
+                    baseUrl,
+                    model
+                );
+
+                settingsPanel
+                    .style
+                    .display =
+                        'none';
+
+                setStatus(
+                    '✓ API 设置已保存'
+                );
+            }
+        );
+
+    // =========================================================
+    // 按钮
+    // =========================================================
+
+    document
+        .getElementById(
+            'ai-translate'
+        )
+        .addEventListener(
+            'click',
+            translate
+        );
+
+    document
+        .getElementById(
+            'ai-analysis'
+        )
+        .addEventListener(
+            'click',
+            analyze
+        );
+
+    document
+        .getElementById(
+            'ai-copy'
+        )
+        .addEventListener(
+            'click',
+            async () => {
+
+                if (!lastResult) {
+                    setStatus(
+                        '当前没有结果可复制'
+                    );
+
+                    return;
+                }
+
+                try {
+                    await navigator
+                        .clipboard
+                        .writeText(
+                            lastResult
+                        );
+
+                    setStatus(
+                        '✓ 已复制到剪贴板'
+                    );
+                }
+
+                catch {
+                    setStatus(
+                        '复制失败，请手动复制'
+                    );
+                }
+            }
+        );
+
+    document
+        .getElementById(
+            'ai-clear'
+        )
+        .addEventListener(
+            'click',
+            () => {
+
+                currentText =
+                    '';
+
+                lastResult =
+                    '';
+
+                content.innerHTML = `
+
+<div class="ai-card">
+
+    <div class="ai-label">
+        已清空
+    </div>
+
+    <div class="ai-text">
+        选择中文或英文后按 Alt + T 开始翻译。
+    </div>
+
+</div>
+`;
+
+                setStatus(
+                    '准备就绪'
+                );
+            }
+        );
+
+    // =========================================================
+    // Alt + T
+    // =========================================================
+
+    document.addEventListener(
+        'keydown',
+        event => {
+
+            if (
+                event.altKey &&
+                !event.ctrlKey &&
+                !event.shiftKey &&
+                !event.metaKey &&
+                event.key
+                    .toLowerCase() ===
+                    't'
+            ) {
+                event
+                    .preventDefault();
+
+                translate();
+            }
+        },
+        true
+    );
+
+    // =========================================================
+    // 窗口尺寸发生变化
+    // =========================================================
+
+    window.addEventListener(
+        'resize',
+        () => {
+
+            const rect =
+                container
+                    .getBoundingClientRect();
+
+            const position =
+                setContainerPosition(
+                    rect.left,
+                    rect.top
+                );
+
+            GM_setValue(
+                'translator_ball_x',
+                position.x
+            );
+
+            GM_setValue(
+                'translator_ball_y',
+                position.y
+            );
+        }
+    );
+
+})();
