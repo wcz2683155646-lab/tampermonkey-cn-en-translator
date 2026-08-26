@@ -1,0 +1,5137 @@
+// ==UserScript==
+// @name         中英词汇助手 + 英语长难句分析 Pro
+// @namespace    tampermonkey-cn-en-translator
+// @version      5.1
+// @description  单词短语翻译、词汇详解、英语长难句分析、剪贴板与状态动画
+// @match        http://*/*
+// @match        https://*/*
+// @match        file:///*
+// @grant        GM_xmlhttpRequest
+// @grant        GM_getValue
+// @grant        GM_setValue
+// @connect      api.openclawplan.com
+// @connect      *
+// @run-at       document-idle
+// ==/UserScript==
+
+(() => {
+    'use strict';
+    console.log('%c[CN-EN Translator] v5.1 loaded','color:#8b5cf6;font-weight:bold;font-size:12px;');
+
+    const DEFAULT_BASE_URL = 'https://api.openclawplan.com/v1';
+    const DEFAULT_MODEL = 'gpt-5.6-terra';
+
+    const NORMAL_TIMEOUT = 60000;
+    const DETAIL_TIMEOUT = 180000;
+    const ARTICLE_MAX_CHARS = 30000;
+
+    const BALL_SIZE = 44;
+    const PANEL_WIDTH = 420;
+
+    let currentText = '';
+    let clipboardText = '';
+    let lastSelectedText = '';
+    let copiedSelectionText = '';
+    let lastResult = '';
+    let panelOpen = false;
+    let requestBusy = false;
+    let clipboardTextLoaded = false;
+    let lastRequest = null;
+    const MAX_QUESTION_TURNS = 6;
+    const MAX_HISTORY_TEXT_CHARS = 12000;
+    const MAX_FAVORITES = 500;
+    let activeRequest = null;
+    let requestToken = 0;
+    let particleOrbitAngle = 0;
+    let particleOrbitActive = false;
+    const particleOrbitItems = [];
+    let edgeLightDistance = 0;
+    let edgeLightActive = false;
+    const edgeLightItems = [];
+    let visualAnimation = 0;
+    let visualLastTime = 0;
+    let visualActive = false;
+    let visualAccumulator = 0;
+    const visualFrameInterval =
+        navigator.hardwareConcurrency && navigator.hardwareConcurrency <= 4
+            ? 33
+            : 22;
+    const reducedMotionQuery = window.matchMedia
+        ? window.matchMedia('(prefers-reduced-motion: reduce)')
+        : { matches: false };
+
+    function loadQuestionHistory() {
+        try {
+            return loadQuestionHistoryFromValue(
+                GM_getValue('translator_question_history', [])
+            );
+        } catch {
+            return [];
+        }
+    }
+
+    function loadVocabularyFavorites() {
+        try {
+            const value = GM_getValue('translator_vocabulary_favorites', []);
+            if (!Array.isArray(value)) return [];
+            return value
+                .filter(item => item && typeof item.text === 'string' && item.text.trim())
+                .map(item => ({
+                    text: item.text.trim().slice(0, 500),
+                    savedAt: Number(item.savedAt) || Date.now()
+                }))
+                .slice(0, MAX_FAVORITES);
+        } catch {
+            return [];
+        }
+    }
+
+    let questionHistory = loadQuestionHistory();
+    let vocabularyFavorites = loadVocabularyFavorites();
+
+    function saveQuestionHistory() {
+        questionHistory = loadQuestionHistoryFromValue(questionHistory);
+        try {
+            GM_setValue('translator_question_history', questionHistory);
+        } catch (error) {
+            console.error('保存问答历史失败', error);
+        }
+    }
+
+    function loadQuestionHistoryFromValue(value) {
+        if (!Array.isArray(value)) return [];
+        return value
+            .filter(item => item && typeof item.question === 'string' && typeof item.answer === 'string')
+            .map(item => ({
+                question: item.question.slice(0, MAX_HISTORY_TEXT_CHARS),
+                answer: item.answer.slice(0, MAX_HISTORY_TEXT_CHARS)
+            }))
+            .slice(-MAX_QUESTION_TURNS);
+    }
+
+    function speakVocabulary(text) {
+        if (!text || !('speechSynthesis' in window)) {
+            setStatus('当前浏览器不支持朗读', 'error');
+            return;
+        }
+        window.speechSynthesis.cancel();
+        const utterance = new SpeechSynthesisUtterance(text);
+        utterance.lang = detectLanguage(text) === 'en' ? 'en-US' : 'zh-CN';
+        window.speechSynthesis.speak(utterance);
+        setStatus('正在朗读词条', 'success');
+    }
+
+    function toggleVocabularyFavorite(text) {
+        const entry = text.trim();
+        if (!entry) return;
+        const index = vocabularyFavorites.findIndex(item => item.text === entry);
+        if (index >= 0) {
+            vocabularyFavorites.splice(index, 1);
+            setStatus('已取消收藏', 'success');
+        } else {
+            vocabularyFavorites.unshift({ text: entry, savedAt: Date.now() });
+            vocabularyFavorites = vocabularyFavorites.slice(0, MAX_FAVORITES);
+            setStatus('已收藏词条', 'success');
+        }
+        try {
+            GM_setValue('translator_vocabulary_favorites', vocabularyFavorites);
+        } catch (error) {
+            setStatus('收藏保存失败：' + error.message, 'error');
+        }
+        updateFavoriteButton();
+    }
+
+    function updateFavoriteButton() {
+        const input = document.getElementById('ai-translation-input');
+        const button = document.getElementById('ai-translation-favorite');
+        if (!input || !button) return;
+        const favorited = vocabularyFavorites.some(item => item.text === input.value.trim());
+        button.classList.toggle('ai-favorited', favorited);
+        button.textContent = favorited ? '★' : '☆';
+    }
+
+    function showVocabularyFavorites() {
+        if (!vocabularyFavorites.length) {
+            setStatus('还没有收藏词条', 'error');
+            return;
+        }
+        content.innerHTML = '';
+        const card = document.createElement('div');
+        card.className = 'ai-card ai-card-result';
+        card.innerHTML = '<div class="ai-label">收藏词条</div><div class="ai-text"></div>';
+        card.querySelector('.ai-text').innerHTML = vocabularyFavorites
+            .map((item, index) => `${index + 1}、<strong>${escapeHtml(item.text)}</strong>`)
+            .join('<br>');
+        content.appendChild(card);
+        openPanel();
+    }
+
+    // =========================================================
+    // API 配置
+    // =========================================================
+
+    function getConfig() {
+        return {
+            apiKey: GM_getValue('translator_api_key', ''),
+            baseUrl: GM_getValue(
+                'translator_base_url',
+                DEFAULT_BASE_URL
+            ),
+            model: GM_getValue(
+                'translator_model',
+                DEFAULT_MODEL
+            )
+        };
+    }
+
+    function saveConfig(apiKey, baseUrl, model) {
+        GM_setValue(
+            'translator_api_key',
+            apiKey.trim()
+        );
+
+        GM_setValue(
+            'translator_base_url',
+            (baseUrl.trim() || DEFAULT_BASE_URL)
+                .replace(/\/+$/, '')
+        );
+
+        GM_setValue(
+            'translator_model',
+            model.trim() || DEFAULT_MODEL
+        );
+    }
+
+    // =========================================================
+    // 判断语言
+    // =========================================================
+
+    function detectLanguage(text) {
+        text = String(text || '');
+
+        const zh =
+            (text.match(/[\u4e00-\u9fff]/g) || []).length;
+
+        const en =
+            (text.match(/[A-Za-z]/g) || []).length;
+
+        if (!zh && !en) return 'unknown';
+        if (zh && !en) return 'zh';
+        if (en && !zh) return 'en';
+
+        const total = zh + en;
+
+        if (zh / total >= 0.6) return 'zh';
+        if (en / total >= 0.6) return 'en';
+
+        return 'mixed';
+    }
+
+    // =========================================================
+    // 获取选中文字
+    // =========================================================
+
+    function getSelectedText() {
+        const active = document.activeElement;
+
+        // 插件自身输入框里的光标或局部选区不能作为网页分析文本。
+        if (active && active.closest?.('#ai-translator-container')) {
+            return '';
+        }
+
+        if (
+            active &&
+            (
+                active.tagName === 'TEXTAREA' ||
+                active.tagName === 'INPUT'
+            )
+        ) {
+            const start = active.selectionStart;
+            const end = active.selectionEnd;
+
+            if (
+                typeof start === 'number' &&
+                typeof end === 'number' &&
+                end > start
+            ) {
+                return active.value
+                    .slice(start, end)
+                    .trim();
+            }
+        }
+
+        try {
+            const selection = window.getSelection();
+            const anchorElement = selection?.anchorNode?.nodeType === Node.ELEMENT_NODE
+                ? selection.anchorNode
+                : selection?.anchorNode?.parentElement;
+            if (anchorElement?.closest?.('#ai-translator-container')) {
+                return '';
+            }
+            return String(
+                selection?.toString() || ''
+            ).trim();
+        } catch {
+            return '';
+        }
+    }
+
+    const CLIPBOARD_MERGE_MIN_LENGTH = 8;
+
+    // 选区与剪贴板互补时，仅在剪贴板文本明显更完整且与选区相关时才替换选区。
+    // 过短的选区（如常见短词）用 includes 极易与无关旧剪贴板误命中，故设置最小长度阈值。
+    function clipboardIsBetterThanSelection(selected, clipboardValue) {
+        if (!clipboardValue) return false;
+        if (!selected) return true;
+        if (clipboardValue.length <= selected.length) return false;
+
+        const normalize = value => value.replace(/\s+/g, ' ').trim().toLowerCase();
+        const selectedNormalized = normalize(selected);
+        const clipboardNormalized = normalize(clipboardValue);
+
+        if (selectedNormalized.length < CLIPBOARD_MERGE_MIN_LENGTH) {
+            return false;
+        }
+
+        return (
+            clipboardNormalized.includes(selectedNormalized) ||
+            selectedNormalized.includes(clipboardNormalized)
+        );
+    }
+
+    // 读取待分析文本。preferClipboardCache 为 true 时优先使用“读取剪贴板”缓存，
+    // 并把合并后的完整剪贴板文本写回缓存字段；否则写回选区缓存字段。
+    async function resolveInputText({ preferClipboardCache }) {
+        if (preferClipboardCache && clipboardTextLoaded && clipboardText) {
+            return clipboardText.trim();
+        }
+
+        const selected = (
+            getSelectedText() ||
+            lastSelectedText ||
+            copiedSelectionText ||
+            ''
+        ).trim();
+
+        try {
+            const clipboardValue = (await navigator.clipboard.readText()).trim();
+            if (!clipboardValue) return selected;
+            if (!selected) return clipboardValue;
+
+            if (clipboardIsBetterThanSelection(selected, clipboardValue)) {
+                if (preferClipboardCache) {
+                    clipboardText = clipboardValue;
+                    clipboardTextLoaded = true;
+                } else {
+                    lastSelectedText = clipboardValue;
+                    copiedSelectionText = clipboardValue;
+                }
+                return clipboardValue;
+            }
+        } catch {
+            // 剪贴板权限不可用时使用网页选区或缓存文本。
+        }
+
+        return selected;
+    }
+
+    function getSentenceAnalysisText() {
+        return resolveInputText({ preferClipboardCache: true });
+    }
+
+    function getSelectedOrClipboardText() {
+        return resolveInputText({ preferClipboardCache: false });
+    }
+
+    // =========================================================
+    // 清理输出格式
+    // =========================================================
+
+    function cleanResult(text) {
+        return String(text || '')
+            .replace(/\r\n/g, '\n')
+            // 去掉模型常见的 Markdown 项目符号和装饰符号，保留文字内容
+            .replace(/^\s*[-*+]\s+/gm, '')
+            .replace(/^\s*#{1,6}\s+/gm, '')
+            .replace(/[ \t]+\n/g, '\n')
+            .replace(/\n[ \t]+\n/g, '\n')
+            .replace(/\n{2,}/g, '\n')
+            .trim();
+    }
+
+    function escapeHtml(text) {
+        return String(text || '')
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;')
+            .replace(/'/g, '&#39;');
+    }
+
+    function formatResult(text) {
+        const escaped = escapeHtml(cleanResult(text));
+
+        return escaped
+            .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+            .replace(/__(.+?)__/g, '<u>$1</u>')
+            .replace(/(^|[\s：:])\*([^*\n]+?)\*(?=\s|$)/g, '$1$2')
+            .replace(/\n/g, '<br>');
+    }
+
+    // =========================================================
+    // Responses API 解析
+    // =========================================================
+
+    function extractOutput(data) {
+        if (!data) return '';
+
+        if (
+            typeof data.output_text === 'string'
+        ) {
+            return data.output_text.trim();
+        }
+
+        if (Array.isArray(data.output)) {
+            const parts = [];
+
+            for (const item of data.output) {
+                if (!Array.isArray(item?.content)) {
+                    continue;
+                }
+
+                for (const c of item.content) {
+                    if (
+                        typeof c?.text === 'string'
+                    ) {
+                        parts.push(c.text);
+                    } else if (
+                        c?.text &&
+                        typeof c.text.value === 'string'
+                    ) {
+                        parts.push(c.text.value);
+                    }
+                }
+            }
+
+            return parts.join('\n').trim();
+        }
+
+        if (
+            data.response &&
+            typeof data.response.output_text === 'string'
+        ) {
+            return data.response.output_text.trim();
+        }
+
+        return '';
+    }
+
+    // =========================================================
+    // API 请求
+    // =========================================================
+
+    function cancelActiveRequest() {
+        requestToken += 1;
+        const active = activeRequest;
+        activeRequest = null;
+        active?.xhr?.abort();
+    }
+
+    function isCancelledError(error) {
+        return error?.message === '请求已取消';
+    }
+
+    // 解析 Responses API 的 SSE 流，累积 output_text 增量。
+    function parseResponsesStream(rawText, state) {
+        // state: { buffer, text }
+        state.buffer += rawText.slice(state.consumed);
+        state.consumed = rawText.length;
+
+        const events = state.buffer.split('\n\n');
+        state.buffer = events.pop() || '';
+
+        for (const chunk of events) {
+            const dataLines = chunk
+                .split('\n')
+                .filter(line => line.startsWith('data:'))
+                .map(line => line.slice(5).trim());
+            if (!dataLines.length) continue;
+            const payload = dataLines.join('\n');
+            if (payload === '[DONE]') continue;
+
+            let evt;
+            try {
+                evt = JSON.parse(payload);
+            } catch {
+                continue;
+            }
+
+            if (evt.type === 'response.output_text.delta' && typeof evt.delta === 'string') {
+                state.text += evt.delta;
+            } else if (evt.type === 'response.completed' && evt.response) {
+                const full = extractOutput(evt.response);
+                if (full) state.text = full;
+            } else if (evt.type === 'response.error' || evt.error) {
+                state.error = evt.error?.message || evt.message || 'API 流式返回错误';
+            }
+        }
+    }
+
+    function requestAPI(
+        prompt,
+        timeout = NORMAL_TIMEOUT,
+        onDelta = null
+    ) {
+        const config = getConfig();
+        const stream = typeof onDelta === 'function';
+
+        return new Promise((resolve, reject) => {
+            if (!config.apiKey) {
+                reject(new Error('请先在设置中填写 API Key'));
+                return;
+            }
+
+            const token = ++requestToken;
+            activeRequest?.xhr?.abort();
+            activeRequest = null;
+            let settled = false;
+            const finish = (handler, value) => {
+                if (settled) return;
+                settled = true;
+                if (activeRequest?.token === token) activeRequest = null;
+                handler(value);
+            };
+            const fail = error => finish(reject, error);
+            const isCurrent = () => token === requestToken;
+            const url = config.baseUrl.replace(/\/+$/, '') + '/responses';
+
+            const streamState = { buffer: '', text: '', consumed: 0, error: null };
+
+            const requestOptions = {
+                method: 'POST',
+                url,
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Authorization': 'Bearer ' + config.apiKey,
+                    'Accept': stream ? 'text/event-stream' : 'application/json'
+                },
+                data: JSON.stringify({
+                    model: config.model,
+                    reasoning: { effort: 'low' },
+                    store: false,
+                    stream,
+                    input: prompt
+                }),
+                timeout,
+                onload(response) {
+                    if (!isCurrent()) {
+                        fail(new Error('请求已取消'));
+                        return;
+                    }
+                    if (response.status < 200 || response.status >= 300) {
+                        let msg = 'HTTP ' + response.status;
+                        try {
+                            const data = JSON.parse(response.responseText);
+                            msg = data?.error?.message || data?.message || msg;
+                        } catch {}
+                        fail(new Error(msg));
+                        return;
+                    }
+
+                    if (stream) {
+                        parseResponsesStream(response.responseText, streamState);
+                        if (streamState.error) {
+                            fail(new Error(streamState.error));
+                            return;
+                        }
+                        if (!streamState.text) {
+                            // 某些服务未真正流式返回，回退解析整段 JSON。
+                            try {
+                                const data = JSON.parse(response.responseText);
+                                const output = extractOutput(data);
+                                if (output) {
+                                    finish(resolve, cleanResult(output));
+                                    return;
+                                }
+                            } catch {}
+                            fail(new Error('API 返回成功，但没有找到文本结果'));
+                            return;
+                        }
+                        finish(resolve, cleanResult(streamState.text));
+                        return;
+                    }
+
+                    let data;
+                    try {
+                        data = JSON.parse(response.responseText);
+                    } catch {
+                        fail(new Error('API 返回内容不是有效 JSON'));
+                        return;
+                    }
+                    const output = extractOutput(data);
+                    if (!output) {
+                        fail(new Error('API 返回成功，但没有找到文本结果'));
+                        return;
+                    }
+                    finish(resolve, cleanResult(output));
+                },
+                onerror() {
+                    fail(new Error('网络请求失败'));
+                },
+                ontimeout() {
+                    fail(new Error('TIMEOUT'));
+                },
+                onabort() {
+                    fail(new Error('请求已取消'));
+                }
+            };
+
+            if (stream) {
+                requestOptions.onprogress = function (response) {
+                    if (!isCurrent()) return;
+                    parseResponsesStream(response.responseText || '', streamState);
+                    if (streamState.text) {
+                        onDelta(cleanResult(streamState.text));
+                    }
+                };
+            }
+
+            const xhr = GM_xmlhttpRequest(requestOptions);
+            activeRequest = { token, xhr };
+        });
+    }
+
+    // =========================================================
+    // 单词与短语翻译 Prompt
+    // =========================================================
+
+    function vocabularyPrompt(text, detail = false) {
+        const level = detail ? `
+请严格按以下结构输出，各部分之间不留空行：
+一、词条
+1、给出原词或原短语、词性（如适用）和音标（英文词条适用）。
+二、核心释义
+1、给出最常用且准确的中文或英文对应表达。
+2、存在多个常用词性或义项时，按常用程度列出，避免堆砌生僻义项。
+三、用法
+1、说明最重要的搭配、介词或语法限制。
+2、给出 2 个简短、自然的双语例句。
+四、派生串记
+1、列出 2～5 个高价值同词根派生词，以“词 → 含义 → 与原词关系”的形式呈现。
+2、若没有可靠派生词，明确写“无常用派生词”，不得编造。
+五、近义词与反义词
+1、列出 2～4 个常用近义词，并简述与原词的关键区别。
+2、列出常用反义词；没有明确反义词时写“无固定反义词”。
+六、词根词缀
+1、拆解词根、前缀、后缀及其含义。
+2、短语或不可可靠拆解的词条写“无适用词根词缀拆解”，不得牵强拆分。
+` : `
+请严格按以下结构输出，各部分之间不留空行：
+一、核心翻译
+1、给出最常用、最准确的对应表达。
+二、常用用法
+1、只列 1～3 个关键搭配或词性提示。
+三、例句
+1、给出 1 个简短自然的双语例句。
+`;
+
+        return `
+你是一名严谨的中英词汇教师。请处理下面的单词或短语；若输入为中文，先给出最自然的英文对应词或短语；若输入为英文，给出准确的简体中文释义。
+${level}
+通用要求：
+1. 只处理单词或短语，不按整句翻译方式展开。
+2. 使用中文分级编号：一级“一、二、三”，二级“1、2、3”。
+3. 重点英文词语、搭配或例句用 **加粗** 或 __下划线__ 标记。
+4. 不使用项目符号、星号装饰、短横线列表、Markdown 表格或无关说明。
+5. 内容准确、简洁、层级清晰；不确定的信息宁可省略，不得编造。
+待查询词条：
+${text}
+`.trim();
+    }
+
+    function pureTranslationPrompt(text, lang) {
+        return `
+You are a professional Chinese-English translator.
+Translate the following ${lang === 'zh' ? 'Chinese' : 'English'} text into ${lang === 'zh' ? 'natural, accurate English' : 'natural, accurate Simplified Chinese'}.
+Requirements:
+1. Return only the translation.
+2. Preserve the original meaning, tone, names, numbers, paragraph breaks and punctuation.
+3. Do not explain, analyze, summarize, add notes, add headings, or provide alternatives.
+4. Do not perform vocabulary, grammar, sentence, or article analysis.
+Text:
+${text}
+`.trim();
+    }
+
+    // =========================================================
+    // 快速分析 Prompt
+    // =========================================================
+
+    function quickPrompt(text) {
+        return `
+你是一名英语老师。快速分析下面英文，只保留真正有助于理解的内容。
+严格按以下格式输出，各部分之间不要空行：
+一、句子主干
+1、指出核心主谓宾或主系表。
+二、关键结构
+1、简洁说明最重要的从句、非谓语和修饰关系。
+三、理解难点
+1、列出 1～3 个最重要的词组、搭配或语法难点。
+四、自然翻译
+1、给出自然准确的简体中文翻译。
+要求：
+1. 不展开讲课。
+2. 不重复原句。
+3. 不解释简单词汇和简单语法。
+4. 整体尽量控制在 250 个中文字以内。
+5. 不使用 Markdown 表格。
+6. 不加入空白行。
+7. 使用中文分级编号：一级使用“一、二、三”，二级使用“1、2、3”。
+8. 真正重要的英文词语或句子用 **加粗** 或 __下划线__ 标记；不要使用项目符号、星号装饰或短横线。
+英文：
+${text}
+`.trim();
+    }
+
+    // =========================================================
+    // 详细分析 Prompt
+    // =========================================================
+
+    function detailPrompt(text) {
+        return `
+你是一名专业英语语法教师，帮助中国学习者理解英语长难句。
+请详细但紧凑地分析下面英文。
+严格按以下格式输出，各部分之间不要空行：
+一、句子主干
+1、指出主语、谓语、宾语或表语，并给出核心句子骨架。
+二、结构拆分
+1、分析主句、从句、非谓语和插入结构，并说明作用。
+三、修饰关系
+1、说明重要介词短语、分词、不定式、定语从句修饰什么；必要时说明代词指代。
+四、重点词组
+1、最多列 5 个重要固定搭配、短语或词义。
+五、理解难点
+1、最多用 3 点说明最容易误解的结构。
+六、自然翻译
+1、给出自然准确的简体中文翻译。
+要求：
+1. 必须针对原句。
+2. 不逐词讲解。
+3. 不解释简单语法。
+4. 不重复内容。
+5. 每部分尽量 2～4 行。
+6. 整体尽量控制在 600 个中文字以内。
+7. 不使用 Markdown 表格。
+8. 不加入空白行。
+9. 使用中文分级编号：一级使用“一、二、三”，二级使用“1、2、3”。
+10. 真正重要的英文词语或句子用 **加粗** 或 __下划线__ 标记；不要使用项目符号、星号装饰或短横线。
+英文：
+${text}
+`.trim();
+    }
+
+    // =========================================================
+    // 详细分析超时备用 Prompt
+    // =========================================================
+
+    function fallbackPrompt(text) {
+        return `
+分析下面英文长难句。
+严格按以下格式输出，不要空行：
+一、句子主干
+1、核心主谓宾或主系表。
+二、关键结构
+1、最重要的从句、非谓语和修饰关系。
+三、理解难点
+1、最多 3 个最影响理解的点。
+四、自然翻译
+1、给出自然准确的简体中文翻译。
+要求：
+1. 准确。
+2. 不逐词分析。
+3. 不解释简单内容。
+4. 不重复。
+5. 控制在 350 个中文字以内。
+6. 使用中文分级编号：一级使用“一、二、三”，二级使用“1、2、3”。重点英文用 **加粗** 或 __下划线__ 标记；不要使用项目符号、星号装饰或短横线。
+英文：
+${text}
+`.trim();
+    }
+
+    function questionPrompt(question) {
+        return `
+You are a patient English teacher helping a Chinese learner.
+Answer the following English question clearly and accurately in Simplified Chinese.
+Use short examples when helpful. Explain important English words or grammar briefly.
+Organize the answer with Chinese hierarchical numbering: first level “一、二、三”, second level “1、2、3”.
+Mark truly important English words or sentences with **bold** or __underline__.
+Do not use bullet points, asterisks as decoration, hyphen lists, or Markdown tables. Keep the answer focused and clean.
+Question:
+${question}
+`.trim();
+    }
+
+    function conversationPrompt(history, question) {
+        const context = history.map((item, index) =>
+            `${index + 1}. 用户问题：${item.question}\n助手回答：${item.answer}`
+        ).join('\n\n');
+        return `${questionPrompt(question)}\n\n${context ? `以下是此前对话，请结合上下文回答追问：\n${context}\n\n` : ''}本轮追问：\n${question}`;
+    }
+
+    function rememberSelection(event = null) {
+        const text = getSelectedText();
+        if (text) {
+            lastSelectedText = text;
+            copiedSelectionText = text;
+            // 用户重新选择网页文本后，后续句子分析应使用新选区。
+            clipboardTextLoaded = false;
+        } else if (
+            event?.type === 'mouseup' &&
+            !event.target?.closest?.('#ai-translator-container')
+        ) {
+            lastSelectedText = '';
+            copiedSelectionText = '';
+        }
+    }
+
+    document.addEventListener('selectionchange', rememberSelection, true);
+    document.addEventListener('mouseup', event => rememberSelection(event), true);
+    document.addEventListener('keyup', rememberSelection, true);
+
+    // 浏览器内置 PDF 查看器有时不向 Selection API 暴露完整文本，
+    // 但会在 Ctrl+C 时把选区写入 copy 事件或系统剪贴板。
+    document.addEventListener('copy', event => {
+        const copied = event.clipboardData?.getData('text/plain')?.trim();
+        const selected = copied || getSelectedText();
+        if (selected) {
+            lastSelectedText = selected;
+            copiedSelectionText = selected;
+            clipboardTextLoaded = false;
+        }
+    }, true);
+
+    function articleQuickPrompt(text) {
+        return `
+你是一名英语阅读与写作老师。请快速分析下面这篇英文文章的结构。
+严格按以下格式输出，各部分之间不要空行：
+一、文章主题
+1、一句话概括文章主题和中心论点。
+二、段落结构
+1、按段落顺序简要说明每一段的功能和主要内容。
+三、逻辑关系
+1、指出最重要的论证、叙述关系、转折和逻辑连接。
+四、中文总结
+1、给出简洁准确的简体中文总结。
+要求：不逐句翻译，不重复原文，不使用 Markdown 表格，整体尽量控制在 500 个中文字以内。使用中文分级编号：一级“一、二、三”，二级“1、2、3”；重点英文用 **加粗** 或 __下划线__ 标记；不要使用项目符号、星号装饰或短横线。
+英文文章：
+${text}
+`.trim();
+    }
+
+    function articleDetailPrompt(text) {
+        return `
+你是一名专业英语阅读与写作教师。请详细但紧凑地分析下面这篇英文文章的结构。
+严格按以下格式输出，各部分之间不要空行：
+一、文章主题与中心论点
+1、概括主题、作者目的和中心论点。
+二、整体结构
+1、说明文章层次、组织方式以及开头、主体、结尾的作用。
+三、逐段概括
+1、按段落顺序概括每段内容和段落功能。
+四、论证与衔接
+1、分析论点、论据、结论的关系，以及重要转折和逻辑连接。
+五、重点表达
+1、列出最多 8 个有助于理解文章的词组/表达并说明含义。
+六、中文总结
+1、给出自然准确的简体中文全文总结。
+要求：必须针对原文，不逐词翻译，不解释简单词汇，不使用 Markdown 表格，整体尽量控制在 1200 个中文字以内。使用中文分级编号：一级“一、二、三”，二级“1、2、3”；重点英文用 **加粗** 或 __下划线__ 标记；不要使用项目符号、星号装饰或短横线。
+英文文章：
+${text}
+`.trim();
+    }
+
+    // =========================================================
+    // CSS
+    // =========================================================
+
+    const style =
+        document.createElement('style');
+
+    style.textContent = `
+#ai-translator-container {
+    position: fixed;
+    z-index: 2147483647;
+    width: ${BALL_SIZE}px;
+    height: ${BALL_SIZE}px;
+    font-family:
+        -apple-system,
+        BlinkMacSystemFont,
+        "Segoe UI",
+        "PingFang SC",
+        "Microsoft YaHei",
+        sans-serif;
+    color: #1f2937;
+    user-select: none;
+}
+
+#ai-translator-ball {
+    position: absolute;
+    top: 0;
+    right: 0;
+    width: ${BALL_SIZE}px;
+    height: ${BALL_SIZE}px;
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: grab;
+    background:
+        linear-gradient(
+            135deg,
+            #2563eb,
+            #6366f1 40%,
+            #9333ea 72%,
+            #db2777
+        );
+    border:
+        1.5px solid
+        rgba(255,255,255,.88);
+    box-shadow:
+        0 7px 22px
+        rgba(79,70,229,.38);
+    transition:
+        transform .18s ease,
+        box-shadow .18s ease;
+}
+
+#ai-translator-ball:hover {
+    transform: scale(1.08);
+    box-shadow:
+        0 10px 30px
+        rgba(124,58,237,.48);
+}
+
+#ai-translator-ball:active {
+    cursor: grabbing;
+}
+
+.ai-ball-inner {
+    width: 34px;
+    height: 34px;
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background:
+        rgba(255,255,255,.13);
+    color: white;
+}
+
+.ai-ball-icon {
+    width: 21px;
+    height: 21px;
+}
+
+#ai-translator-panel {
+    position: absolute;
+    width: ${PANEL_WIDTH}px;
+    height: 50vh;
+    min-height: 360px;
+    max-height: calc(100vh - 16px);
+    right: 56px;
+    top: 0;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    background:
+        rgba(255,255,255,.975);
+    backdrop-filter:
+        blur(22px);
+    border:
+        1px solid
+        rgba(148,163,184,.30);
+    border-radius: 18px;
+    box-shadow:
+        0 20px 60px
+        rgba(15,23,42,.20);
+    opacity: 0;
+    visibility: hidden;
+    transform:
+        translateX(10px)
+        scale(.98);
+    transition:
+        opacity .18s ease,
+        transform .18s ease,
+        visibility .18s;
+    pointer-events: none;
+    user-select: text;
+    isolation: isolate;
+}
+
+/* 面板底层的黑洞装饰，不参与交互，可被内容卡片和弹窗覆盖。 */
+.ai-blackhole-cover {
+    position: absolute;
+    inset: 0;
+    z-index: 0;
+    overflow: hidden;
+    pointer-events: none;
+    opacity: 0;
+    transform: rotate(0deg) scale(1.3);
+    filter: saturate(.82) blur(.2px);
+    transition: opacity .45s ease;
+}
+
+#ai-translator-container.ai-open .ai-blackhole-cover {
+    opacity: .62;
+}
+
+.ai-blackhole-cover::after {
+    content: '';
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    width: 300px;
+    height: 170px;
+    z-index: 5;
+    border: 1px solid rgba(255,255,255,.24);
+    border-radius: 50%;
+    background:
+        linear-gradient(
+            135deg,
+            rgba(255,255,255,.14),
+            rgba(226,238,255,.07) 48%,
+            rgba(255,255,255,.10)
+        );
+    box-shadow:
+        0 2px 0 rgba(255,255,255,.30) inset,
+        0 -1px 0 rgba(148,163,184,.10) inset,
+        0 0 24px rgba(255,255,255,.10);
+    backdrop-filter: blur(10px) saturate(88%);
+    -webkit-backdrop-filter: blur(10px) saturate(88%);
+    opacity: 0;
+    transform: translate(-50%, -50%);
+    transition: opacity .45s ease;
+    pointer-events: none;
+}
+
+#ai-translator-container.ai-open .ai-blackhole-cover::after {
+    opacity: 1;
+}
+
+.ai-blackhole-particles,
+.ai-blackhole-core {
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+}
+
+.ai-blackhole-particles {
+    width: 258px;
+    height: 146px;
+    transform: translate(-50%, -50%) rotate(-3deg) skewX(-8deg);
+    z-index: 3;
+    contain: layout style paint;
+}
+
+.ai-blackhole-particle {
+    position: absolute;
+    border-radius: 50%;
+    background: #000;
+    box-shadow: 0 0 5px rgba(0, 0, 0, .48);
+    transform: translate(-50%, -50%);
+}
+
+.ai-blackhole-core {
+    width: 76px;
+    height: 76px;
+    border-radius: 50%;
+    background: #000;
+    box-shadow:
+        0 0 0 7px rgba(0, 0, 0, .14),
+        0 0 30px rgba(0, 0, 0, .58);
+    transform: translate(-46%, -56%);
+    z-index: 4;
+}
+
+.ai-header,
+#ai-content,
+#ai-status {
+    position: relative;
+    z-index: 2;
+}
+
+#ai-resize-handle {
+    position: absolute;
+    right: 0;
+    bottom: 0;
+    left: 0;
+    height: 16px;
+    cursor: ns-resize;
+    z-index: 60;
+}
+
+#ai-resize-handle::after {
+    content: '';
+    position: absolute;
+    left: 50%;
+    bottom: 5px;
+    width: 52px;
+    height: 4px;
+    border-radius: 3px;
+    background: #cbd5e1;
+    transform: translateX(-50%);
+}
+
+#ai-translator-container.ai-open
+#ai-translator-panel {
+    opacity: 1;
+    visibility: visible;
+    transform:
+        translateX(0)
+        scale(1);
+    pointer-events: auto;
+}
+
+.ai-header {
+    height: 60px;
+    min-height: 60px;
+    padding: 0 15px;
+    display: flex;
+    align-items: center;
+    background:
+        linear-gradient(
+            120deg,
+            rgba(59,130,246,.10),
+            rgba(139,92,246,.10),
+            rgba(236,72,153,.08)
+        );
+    border-bottom:
+        1px solid #eef2f7;
+}
+
+.ai-logo {
+    width: 36px;
+    height: 36px;
+    border-radius: 11px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    margin-right: 10px;
+    color: white;
+    font-weight: 800;
+    background:
+        linear-gradient(
+            135deg,
+            #3b82f6,
+            #7c3aed
+        );
+    box-shadow:
+        0 5px 14px
+        rgba(99,102,241,.25);
+}
+
+.ai-header-text {
+    flex: 1;
+}
+
+.ai-title {
+    font-size: 15px;
+    font-weight: 750;
+    color: #111827;
+}
+
+.ai-subtitle {
+    margin-top: 2px;
+    font-size: 10px;
+    color: #94a3b8;
+}
+
+#ai-translator-panel button {
+    border: 0;
+    border-radius: 9px;
+    cursor: pointer;
+    font-weight: 600;
+    transition:
+        transform .16s ease,
+        filter .16s ease;
+}
+
+#ai-translator-panel button:hover {
+    transform: translateY(-1px);
+    filter: brightness(.98);
+}
+
+.ai-settings-btn {
+    padding: 7px 10px;
+    font-size: 12px;
+    color: #475569;
+    background:
+        rgba(255,255,255,.8);
+    border:
+        1px solid
+        #e2e8f0 !important;
+}
+
+.ai-toolbar {
+    position: relative;
+    z-index: 100;
+    padding: 9px 11px;
+    display: grid;
+    grid-template-columns: repeat(6, 1fr);
+    gap: 6px;
+    background: #fafbff;
+    border-bottom:
+        1px solid #edf0f7;
+}
+
+.ai-question-btn {
+    width: 34px;
+    height: 32px;
+    margin-right: 6px;
+    padding: 0;
+    color: #1d4ed8;
+    background: #dbeafe;
+    border: 1px solid #bfdbfe !important;
+    font-size: 16px;
+}
+
+.ai-pure-translate-btn {
+    width: 34px;
+    height: 32px;
+    margin-right: 6px;
+    padding: 0;
+    color: #047857;
+    background: #d1fae5;
+    border: 1px solid #a7f3d0 !important;
+    font-size: 16px;
+}
+
+.ai-menu {
+    position: relative;
+}
+
+.ai-menu > button {
+    width: 100%;
+}
+
+.ai-submenu {
+    position: absolute;
+    top: calc(100% + 5px);
+    left: 0;
+    z-index: 120;
+    display: none;
+    min-width: 118px;
+    padding: 5px;
+    border: 1px solid #e2e8f0;
+    border-radius: 10px;
+    background: rgba(255,255,255,.98);
+    box-shadow: 0 10px 24px rgba(15,23,42,.16);
+}
+
+.ai-menu.ai-menu-open {
+    z-index: 110;
+}
+
+.ai-menu.ai-menu-open .ai-submenu {
+    display: grid;
+    gap: 4px;
+}
+
+.ai-submenu button {
+    height: 30px;
+    padding: 0 9px;
+    white-space: nowrap;
+    text-align: left;
+    font-size: 12px;
+    color: #334155;
+    background: #f8fafc;
+}
+
+.ai-toolbar button {
+    height: 34px;
+    padding: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 15px;
+}
+
+.ai-btn-translate {
+    color: white;
+    background:
+        linear-gradient(
+            135deg,
+            #3b82f6,
+            #6366f1
+        );
+}
+
+.ai-btn-quick {
+    color: #92400e;
+    background:
+        linear-gradient(
+            135deg,
+            #fef3c7,
+            #fde68a
+        );
+}
+
+.ai-btn-analysis {
+    color: white;
+    background:
+        linear-gradient(
+            135deg,
+            #8b5cf6,
+            #a855f7
+        );
+}
+
+.ai-btn-paste {
+    color: #0369a1;
+    background: #e0f2fe;
+}
+
+.ai-btn-copy {
+    color: #047857;
+    background: #ecfdf5;
+}
+
+.ai-btn-clear {
+    color: #be123c;
+    background: #fff1f2;
+}
+
+#ai-content {
+    position: relative;
+    z-index: 2;
+    flex: 1;
+    overflow-y: auto;
+    padding: 12px;
+    background:
+        linear-gradient(
+            180deg,
+            rgba(255,255,255,.78),
+            rgba(250,251,255,.78)
+        );
+}
+
+#ai-content::-webkit-scrollbar {
+    width: 6px;
+}
+
+#ai-content::-webkit-scrollbar-thumb {
+    background: #cbd5e1;
+    border-radius: 10px;
+}
+
+.ai-card {
+    border:
+        1px solid #e8ebf3;
+    border-radius: 13px;
+    padding: 11px 12px;
+    margin-bottom: 9px;
+    background:
+        rgba(255,255,255,.96);
+    box-shadow:
+        0 3px 10px
+        rgba(15,23,42,.035);
+}
+
+.ai-card-original {
+    border-left:
+        4px solid #3b82f6;
+}
+
+.ai-card-result {
+    border-left:
+        4px solid #8b5cf6;
+}
+
+.ai-card-error {
+    border-left:
+        4px solid #ef4444;
+    background: #fffafa;
+}
+
+.ai-label {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-bottom: 6px;
+    font-size: 11px;
+    font-weight: 750;
+    color: #64748b;
+}
+
+.ai-dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+}
+
+.ai-dot-blue {
+    background: #3b82f6;
+    box-shadow:
+        0 0 0 3px #dbeafe;
+}
+
+.ai-dot-purple {
+    background: #8b5cf6;
+    box-shadow:
+        0 0 0 3px #ede9fe;
+}
+
+.ai-text {
+    white-space: pre-wrap;
+    word-break: break-word;
+    line-height: 1.58;
+    font-size: 13.5px;
+    color: #334155;
+}
+
+.ai-result-actions {
+    display: flex;
+    gap: 6px;
+    margin-top: 9px;
+}
+
+.ai-result-actions button {
+    padding: 5px 8px;
+    font-size: 11px;
+    color: #475569;
+    background: #f1f5f9;
+}
+
+.ai-result-section {
+    margin-bottom: 8px;
+    border: 1px solid #ede9fe;
+    border-radius: 9px;
+    overflow: hidden;
+}
+
+.ai-result-section-title {
+    width: 100%;
+    min-height: 34px;
+    padding: 7px 9px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    border-radius: 0 !important;
+    color: #4c1d95;
+    background: #faf5ff;
+    text-align: left;
+    font-size: 12px;
+    font-weight: 800 !important;
+}
+
+.ai-result-section-icon {
+    color: #7c3aed;
+    font-size: 13px;
+}
+
+.ai-result-section-body {
+    padding: 8px 9px;
+}
+
+.ai-result-section.ai-section-collapsed .ai-result-section-body {
+    display: none;
+}
+
+.ai-text strong {
+    color: #111827;
+    font-weight: 800;
+}
+
+.ai-text u {
+    text-decoration-thickness: 1.5px;
+    text-decoration-color: #2563eb;
+    text-underline-offset: 2px;
+}
+
+/* 状态栏 */
+
+#ai-status {
+    min-height: 46px;
+    padding: 9px 13px;
+    display: flex;
+    align-items: center;
+    border-top:
+        1px solid #e2e8f0;
+    background:
+        linear-gradient(
+            90deg,
+            #f8fafc,
+            #eef2ff
+        );
+    transition:
+        background .2s ease;
+}
+
+.ai-status-indicator {
+    width: 24px;
+    height: 24px;
+    flex: 0 0 auto;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    margin-right: 10px;
+}
+
+.ai-status-dot {
+    width: 9px;
+    height: 9px;
+    border-radius: 50%;
+    background: #22c55e;
+    box-shadow:
+        0 0 0 4px
+        rgba(34,197,94,.14);
+}
+
+.ai-status-spinner {
+    width: 18px;
+    height: 18px;
+    opacity: 1 !important;
+    border-radius: 50%;
+    border:
+        2.5px solid
+        rgba(99,102,241,.20);
+    border-top-color:
+        #6366f1;
+    animation:
+        ai-status-spin
+        .7s linear infinite;
+}
+
+@keyframes ai-status-spin {
+    from {
+        transform: rotate(0deg);
+    }
+
+    to {
+        transform: rotate(360deg);
+    }
+}
+
+#ai-status-text {
+    font-size: 13px;
+    font-weight: 750;
+    color: #334155;
+    letter-spacing: .1px;
+}
+
+#ai-status.ai-working {
+    background:
+        linear-gradient(
+            90deg,
+            #eef2ff,
+            #f5f3ff
+        );
+}
+
+#ai-status.ai-working
+#ai-status-text {
+    color: #4f46e5;
+}
+
+#ai-status.ai-success {
+    background:
+        linear-gradient(
+            90deg,
+            #f0fdf4,
+            #ecfdf5
+        );
+}
+
+#ai-status.ai-success
+#ai-status-text {
+    color: #15803d;
+}
+
+#ai-status.ai-error {
+    background:
+        linear-gradient(
+            90deg,
+            #fff1f2,
+            #fff7ed
+        );
+}
+
+#ai-status.ai-error
+#ai-status-text {
+    color: #be123c;
+}
+
+/* API 设置 */
+
+#ai-settings {
+    position: absolute;
+    top: 68px;
+    left: 14px;
+    right: 14px;
+    z-index: 50;
+    padding: 15px;
+    border-radius: 15px;
+    background:
+        rgba(255,255,255,.985);
+    border:
+        1px solid #e2e8f0;
+    box-shadow:
+        0 15px 40px
+        rgba(15,23,42,.18);
+    display: none;
+}
+
+#ai-question {
+    position: absolute;
+    top: 68px;
+    left: 14px;
+    right: 14px;
+    z-index: 50;
+    padding: 15px;
+    border-radius: 15px;
+    background: rgba(255,255,255,.985);
+    border: 1px solid #e2e8f0;
+    box-shadow: 0 15px 40px rgba(15,23,42,.18);
+    display: none;
+}
+
+#ai-translation-dialog {
+    position: absolute;
+    top: 68px;
+    left: 14px;
+    right: 14px;
+    z-index: 50;
+    padding: 15px;
+    border-radius: 15px;
+    background: rgba(255,255,255,.985);
+    border: 1px solid #e2e8f0;
+    box-shadow: 0 15px 40px rgba(15,23,42,.18);
+    display: none;
+}
+
+#ai-pure-translation-dialog {
+    position: absolute;
+    top: 68px;
+    left: 14px;
+    right: 14px;
+    z-index: 50;
+    padding: 15px;
+    border-radius: 15px;
+    background: rgba(255,255,255,.985);
+    border: 1px solid #e2e8f0;
+    box-shadow: 0 15px 40px rgba(15,23,42,.18);
+    display: none;
+}
+
+#ai-pure-translation-input {
+    width: 100%;
+    min-height: 120px;
+    box-sizing: border-box;
+    resize: vertical;
+    padding: 9px 10px;
+    border: 1px solid #dbe2ea;
+    border-radius: 8px;
+    outline: none;
+    font: inherit;
+    font-size: 12px;
+}
+
+#ai-pure-translation-input:focus {
+    border-color: #10b981;
+    box-shadow: 0 0 0 3px rgba(16,185,129,.10);
+}
+
+.ai-pure-translation-submit {
+    color: white;
+    background: linear-gradient(135deg, #059669, #10b981);
+}
+
+.ai-translation-title {
+    margin-bottom: 10px;
+    color: #1e293b;
+    font-size: 14px;
+    font-weight: 750;
+}
+
+#ai-translation-input {
+    width: 100%;
+    min-height: 96px;
+    box-sizing: border-box;
+    resize: vertical;
+    padding: 9px 10px;
+    border: 1px solid #dbe2ea;
+    border-radius: 8px;
+    outline: none;
+    font: inherit;
+    font-size: 12px;
+}
+
+#ai-translation-input:focus {
+    border-color: #6366f1;
+    box-shadow: 0 0 0 3px rgba(99,102,241,.10);
+}
+
+.ai-translation-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 7px;
+    margin-top: 10px;
+}
+
+.ai-translation-actions button {
+    padding: 7px 11px;
+    font-size: 12px;
+}
+
+.ai-translation-paste {
+    margin-right: auto;
+    color: #0369a1;
+    background: #e0f2fe;
+}
+
+.ai-translation-cancel {
+    color: #475569;
+    background: #f1f5f9;
+}
+
+.ai-translation-submit {
+    color: white;
+    background: linear-gradient(135deg, #3b82f6, #6366f1);
+}
+
+.ai-translation-detail {
+    color: #6d28d9;
+    background: #f3e8ff;
+}
+
+.ai-translation-speak,
+.ai-translation-favorite,
+.ai-translation-batch {
+    color: #475569;
+    background: #f1f5f9;
+}
+
+.ai-translation-favorite.ai-favorited {
+    color: #b45309;
+    background: #fef3c7;
+}
+
+.ai-question-title {
+    font-size: 14px;
+    font-weight: 750;
+    margin-bottom: 10px;
+    color: #1e293b;
+}
+
+#ai-question-input {
+    width: 100%;
+    min-height: 82px;
+    box-sizing: border-box;
+    resize: vertical;
+    padding: 9px 10px;
+    border-radius: 8px;
+    border: 1px solid #dbe2ea;
+    outline: none;
+    font: inherit;
+    font-size: 12px;
+}
+
+#ai-question-input:focus {
+    border-color: #60a5fa;
+    box-shadow: 0 0 0 3px rgba(59,130,246,.10);
+}
+
+.ai-question-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 7px;
+    margin-top: 10px;
+}
+
+.ai-question-actions button {
+    padding: 7px 11px;
+    font-size: 12px;
+}
+
+.ai-question-cancel {
+    background: #f1f5f9;
+    color: #475569;
+}
+
+.ai-question-submit {
+    color: white;
+    background: linear-gradient(135deg, #2563eb, #4f46e5);
+}
+
+.ai-question-new {
+    background: #eef2ff;
+    color: #4338ca;
+}
+
+.ai-setting-title {
+    font-size: 14px;
+    font-weight: 750;
+    margin-bottom: 13px;
+    color: #1e293b;
+}
+
+#ai-settings label {
+    display: block;
+    font-size: 11px;
+    color: #64748b;
+    font-weight: 650;
+    margin-top: 8px;
+    margin-bottom: 4px;
+}
+
+#ai-settings input {
+    width: 100%;
+    box-sizing: border-box;
+    padding: 8px 10px;
+    border-radius: 8px;
+    border:
+        1px solid #dbe2ea;
+    outline: none;
+    font-size: 12px;
+}
+
+#ai-settings input:focus {
+    border-color: #818cf8;
+    box-shadow:
+        0 0 0 3px
+        rgba(99,102,241,.10);
+}
+
+.ai-setting-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 7px;
+    margin-top: 13px;
+}
+
+.ai-save {
+    padding: 7px 11px;
+    background:
+        linear-gradient(
+            135deg,
+            #6366f1,
+            #8b5cf6
+        );
+    color: white;
+}
+
+.ai-cancel {
+    padding: 7px 11px;
+    background: #f1f5f9;
+    color: #475569;
+}
+
+/* =======================================================
+   v5.1 动画性能优化
+   ======================================================= */
+
+@media (prefers-reduced-motion: reduce) {
+    * {
+        animation-duration: .001ms !important;
+        animation-iteration-count: 1 !important;
+        transition-duration: .001ms !important;
+    }
+}
+
+/* ---------- 悬浮球：触发渐变 + 弹性 hover + 拖拽反馈 ---------- */
+
+#ai-translator-ball {
+    background-image:
+        linear-gradient(
+            135deg,
+            #06b6d4 0%,
+            #2563eb 24%,
+            #7c3aed 48%,
+            #d946ef 72%,
+            #fb7185 100%
+        );
+    background-size: 180% 180%;
+    background-position: 0% 50%;
+    transition:
+        transform .28s cubic-bezier(.34, 1.56, .64, 1),
+        box-shadow .28s ease,
+        background-position .45s ease;
+}
+
+#ai-translator-ball::before {
+    content: '';
+    position: absolute;
+    inset: -4px;
+    border-radius: 50%;
+    background:
+        radial-gradient(
+            circle,
+            rgba(124, 58, 237, .45),
+            transparent 70%
+        );
+    z-index: -1;
+    opacity: .7;
+    transition: opacity .3s ease, background .3s ease, inset .3s ease;
+}
+
+#ai-translator-ball:hover {
+    transform: scale(1.12);
+    background-position: 100% 50%;
+    background-size: 150% 150%;
+}
+
+#ai-translator-ball:active {
+    transform: scale(.94);
+    background-position: 100% 50%;
+    transition: transform .1s ease, background-position .45s ease;
+}
+
+#ai-translator-container.ai-open #ai-translator-ball {
+    background-position: 100% 50%;
+    background-size: 160% 160%;
+}
+
+#ai-translator-container.ai-gradient-active #ai-translator-ball {
+    background-image:
+        linear-gradient(
+            135deg,
+            #00f5d4 0%,
+            #00bbf9 22%,
+            #9b5de5 45%,
+            #f15bb5 66%,
+            #fee440 84%,
+            #fb5607 100%
+        );
+    background-size: 220% 220%;
+    filter: saturate(1.45) brightness(1.08);
+    animation: ai-ball-pulse-core .82s cubic-bezier(.22, 1, .36, 1) both;
+}
+
+#ai-translator-ball::after {
+    content: '';
+    position: absolute;
+    inset: -8px;
+    border: 2px solid rgba(236, 72, 153, .72);
+    border-radius: 50%;
+    opacity: 0;
+    transform: scale(.72);
+    pointer-events: none;
+}
+
+#ai-translator-container.ai-gradient-active #ai-translator-ball::after {
+    animation: ai-ball-pulse-ring .82s cubic-bezier(.22, 1, .36, 1) both;
+}
+
+#ai-translator-container.ai-open #ai-translator-ball::before,
+#ai-translator-ball:hover::before {
+    inset: -8px;
+    opacity: 1;
+    background:
+        radial-gradient(
+            circle,
+            rgba(236, 72, 153, .5),
+            transparent 70%
+        );
+}
+
+#ai-translator-container.ai-dragging #ai-translator-ball {
+    transform: scale(1.16);
+    box-shadow: 0 16px 40px rgba(124, 58, 237, .55);
+}
+
+#ai-translator-container.ai-dragging #ai-translator-ball::before {
+    animation: none;
+    opacity: 1;
+}
+
+.ai-ball-icon {
+    transition: color .3s ease, filter .3s ease;
+}
+
+#ai-translator-ball:hover .ai-ball-icon {
+    color: #fff7ed;
+    filter: drop-shadow(0 0 5px rgba(255,255,255,.65));
+}
+
+@keyframes ai-ball-pulse-core {
+    0% { transform: scale(1); box-shadow: 0 7px 22px rgba(79,70,229,.38); }
+    35% { transform: scale(1.2); box-shadow: 0 0 0 8px rgba(236,72,153,.14), 0 14px 34px rgba(219,39,119,.48); }
+    100% { transform: scale(1); box-shadow: 0 10px 30px rgba(124,58,237,.48); }
+}
+
+@keyframes ai-ball-pulse-ring {
+    0% { opacity: .78; transform: scale(.72); }
+    100% { opacity: 0; transform: scale(1.55); }
+}
+
+/* ---------- 面板开合：弹性滑入 + 模糊渐显 ---------- */
+
+#ai-translator-panel {
+    transition:
+        opacity .32s ease,
+        transform .38s cubic-bezier(.22, 1, .36, 1),
+        visibility .38s,
+        filter .32s ease;
+    transform: translateX(18px) scale(.94) translateY(6px);
+    filter: blur(6px);
+}
+
+#ai-translator-container.ai-open #ai-translator-panel {
+    transform: translateX(0) scale(1) translateY(0);
+    filter: blur(0);
+}
+
+/* 面板打开时，内部区域依次淡入上滑 */
+
+#ai-translator-container.ai-open .ai-header {
+    animation: ai-rise-in .42s ease both;
+    animation-delay: .04s;
+}
+
+#ai-translator-container.ai-open .ai-toolbar {
+    animation: ai-rise-in .42s ease both;
+    animation-delay: .1s;
+}
+
+#ai-translator-container.ai-open #ai-content {
+    animation: ai-rise-in .42s ease both;
+    animation-delay: .16s;
+}
+
+#ai-translator-container.ai-open #ai-status {
+    animation: ai-rise-in .42s ease both;
+    animation-delay: .22s;
+}
+
+@keyframes ai-rise-in {
+    from {
+        opacity: 0;
+        transform: translateY(10px);
+    }
+    to {
+        opacity: 1;
+        transform: translateY(0);
+    }
+}
+
+/* ---------- Logo 轻微浮动 ---------- */
+
+.ai-logo {
+    animation: ai-logo-float 4s ease-in-out infinite;
+    transition: transform .3s cubic-bezier(.34, 1.56, .64, 1);
+}
+
+.ai-logo:hover {
+    transform: scale(1.08);
+}
+
+@keyframes ai-logo-float {
+    0%, 100% {
+        transform: translateY(0);
+    }
+    50% {
+        transform: translateY(-3px);
+    }
+}
+
+/* ---------- 结果卡片：入场淡入上滑 ---------- */
+
+.ai-card {
+    transition:
+        box-shadow .28s ease,
+        transform .28s ease,
+        border-color .28s ease;
+}
+
+.ai-card {
+    animation: ai-card-in .5s cubic-bezier(.22, 1, .36, 1) both;
+}
+
+.ai-card:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 10px 26px rgba(15, 23, 42, .1);
+}
+
+@keyframes ai-card-in {
+    from {
+        opacity: 0;
+        transform: translateY(14px) scale(.98);
+    }
+    to {
+        opacity: 1;
+        transform: translateY(0) scale(1);
+    }
+}
+
+/* 左侧色条呼吸高亮（结果卡片） */
+
+.ai-card-result {
+    position: relative;
+    overflow: hidden;
+}
+
+.ai-card-result::after {
+    content: '';
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 4px;
+    height: 100%;
+    background:
+        linear-gradient(
+            180deg,
+            #8b5cf6,
+            #ec4899,
+            #8b5cf6
+        );
+    background-size: 100% 200%;
+    animation: ai-bar-flow 3s linear infinite;
+}
+
+@keyframes ai-bar-flow {
+    from { background-position: 0 0; }
+    to { background-position: 0 200%; }
+}
+
+/* ---------- 分节展开/收起：平滑滑动 ---------- */
+
+.ai-result-section-body {
+    overflow: hidden;
+    transition:
+        max-height .34s cubic-bezier(.22, 1, .36, 1),
+        opacity .28s ease,
+        padding .28s ease;
+    max-height: 600px;
+    opacity: 1;
+}
+
+.ai-result-section.ai-section-collapsed .ai-result-section-body {
+    display: block;
+    max-height: 0;
+    opacity: 0;
+    padding-top: 0;
+    padding-bottom: 0;
+}
+
+.ai-result-section-icon {
+    transition: transform .3s cubic-bezier(.34, 1.56, .64, 1);
+}
+
+.ai-result-section:not(.ai-section-collapsed) .ai-result-section-icon {
+    transform: rotate(180deg);
+}
+
+.ai-result-section-title:hover {
+    background: #f3ebff;
+}
+
+/* ---------- 按钮：点击涟漪 + 光泽扫过 ---------- */
+
+#ai-translator-panel button {
+    position: relative;
+    overflow: hidden;
+    transition:
+        transform .18s cubic-bezier(.34, 1.56, .64, 1),
+        filter .18s ease,
+        box-shadow .18s ease;
+}
+
+#ai-translator-panel button:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 6px 16px rgba(99, 102, 241, .2);
+}
+
+#ai-translator-panel button:active {
+    transform: translateY(0) scale(.96);
+}
+
+.ai-ripple {
+    position: absolute;
+    border-radius: 50%;
+    background: rgba(255, 255, 255, .55);
+    transform: scale(0);
+    animation: ai-ripple-out .55s ease-out;
+    pointer-events: none;
+}
+
+@keyframes ai-ripple-out {
+    to {
+        transform: scale(2.6);
+        opacity: 0;
+    }
+}
+
+.ai-btn-translate,
+.ai-btn-analysis {
+    background-size: 160% 160%;
+    animation: ai-gradient-shift 6s ease infinite;
+}
+
+@keyframes ai-gradient-shift {
+    0%, 100% { background-position: 0% 50%; }
+    50% { background-position: 100% 50%; }
+}
+
+/* ---------- 状态栏：切换时脉冲 + 成功/错误抖动 ---------- */
+
+#ai-status {
+    transition:
+        background .3s ease,
+        box-shadow .3s ease;
+}
+
+#ai-status.ai-status-flash {
+    animation: ai-status-flash .5s ease;
+}
+
+@keyframes ai-status-flash {
+    0% { transform: translateY(0); }
+    30% { transform: translateY(-2px); }
+    100% { transform: translateY(0); }
+}
+
+#ai-status.ai-success .ai-status-dot {
+    animation: ai-dot-pop .5s cubic-bezier(.34, 1.56, .64, 1);
+}
+
+@keyframes ai-dot-pop {
+    0% { transform: scale(0); }
+    60% { transform: scale(1.4); }
+    100% { transform: scale(1); }
+}
+
+#ai-status.ai-error {
+    animation: ai-shake .4s ease;
+}
+
+@keyframes ai-shake {
+    0%, 100% { transform: translateX(0); }
+    20% { transform: translateX(-5px); }
+    40% { transform: translateX(5px); }
+    60% { transform: translateX(-3px); }
+    80% { transform: translateX(3px); }
+}
+
+#ai-status-text {
+    transition: color .3s ease;
+}
+
+#ai-status.ai-working .ai-status-spinner {
+    opacity: 1 !important;
+}
+
+#ai-status {
+    position: relative;
+    overflow: hidden;
+}
+
+/* ---------- 流式打字：光标闪烁 ---------- */
+
+.ai-streaming-cursor::after {
+    content: '▋';
+    margin-left: 1px;
+    color: #8b5cf6;
+    animation: ai-caret-blink 1s step-end infinite;
+}
+
+@keyframes ai-caret-blink {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0; }
+}
+
+/* ---------- 工具栏按钮进场微交错 ---------- */
+
+#ai-translator-container.ai-open .ai-toolbar > * {
+    animation: ai-pop-in .4s cubic-bezier(.34, 1.56, .64, 1) both;
+}
+
+#ai-translator-container.ai-open .ai-toolbar > *:nth-child(1) { animation-delay: .12s; }
+#ai-translator-container.ai-open .ai-toolbar > *:nth-child(2) { animation-delay: .16s; }
+#ai-translator-container.ai-open .ai-toolbar > *:nth-child(3) { animation-delay: .2s; }
+#ai-translator-container.ai-open .ai-toolbar > *:nth-child(4) { animation-delay: .24s; }
+#ai-translator-container.ai-open .ai-toolbar > *:nth-child(5) { animation-delay: .28s; }
+#ai-translator-container.ai-open .ai-toolbar > *:nth-child(6) { animation-delay: .32s; }
+
+@keyframes ai-pop-in {
+    from {
+        opacity: 0;
+        transform: scale(.8);
+    }
+    to {
+        opacity: 1;
+        transform: scale(1);
+    }
+}
+
+/* =======================================================
+   Liquid glass surface system
+   ======================================================= */
+
+#ai-translator-panel {
+    --glass-white: rgba(255, 255, 255, .48);
+    --glass-edge: rgba(255, 255, 255, .72);
+    --glass-shadow: rgba(15, 23, 42, .18);
+    background: rgba(238, 244, 255, .46);
+    border: 1px solid var(--glass-edge);
+    box-shadow:
+        0 24px 70px rgba(15, 23, 42, .22),
+        0 3px 0 rgba(255, 255, 255, .72) inset,
+        0 -1px 0 rgba(255, 255, 255, .35) inset,
+        0 0 0 1px rgba(148, 163, 184, .12);
+    backdrop-filter: blur(28px) saturate(155%);
+    -webkit-backdrop-filter: blur(28px) saturate(155%);
+}
+
+#ai-translator-panel::before {
+    content: '';
+    position: absolute;
+    inset: 1px;
+    z-index: 0;
+    border-radius: 17px;
+    pointer-events: none;
+    background:
+        radial-gradient(circle at 12% 0%, rgba(255,255,255,.66), transparent 32%),
+        radial-gradient(circle at 92% 100%, rgba(167,139,250,.14), transparent 34%),
+        linear-gradient(135deg, rgba(255,255,255,.26), rgba(255,255,255,.04) 48%, rgba(125,211,252,.12));
+    box-shadow:
+        0 0 0 1px rgba(255,255,255,.30) inset,
+        0 0 24px rgba(255,255,255,.18) inset;
+}
+
+.ai-header,
+.ai-toolbar,
+#ai-content,
+#ai-status {
+    background-color: transparent;
+}
+
+.ai-header {
+    border-bottom-color: rgba(255,255,255,.48);
+    background:
+        linear-gradient(135deg, rgba(255,255,255,.46), rgba(255,255,255,.12));
+    box-shadow: 0 1px 0 rgba(255,255,255,.62) inset;
+    backdrop-filter: blur(20px) saturate(145%);
+    -webkit-backdrop-filter: blur(20px) saturate(145%);
+}
+
+.ai-logo,
+.ai-settings-btn,
+.ai-question-btn,
+.ai-pure-translate-btn,
+.ai-toolbar button,
+.ai-submenu,
+.ai-submenu button,
+#ai-settings,
+#ai-question,
+#ai-translation-dialog,
+#ai-pure-translation-dialog,
+.ai-card,
+#ai-status {
+    border: 1px solid rgba(255,255,255,.62) !important;
+    background: rgba(255,255,255,.34) !important;
+    box-shadow:
+        0 12px 28px rgba(15,23,42,.10),
+        0 2px 0 rgba(255,255,255,.72) inset,
+        0 -1px 0 rgba(148,163,184,.10) inset,
+        0 0 0 1px rgba(148,163,184,.08);
+    backdrop-filter: blur(20px) saturate(150%);
+    -webkit-backdrop-filter: blur(20px) saturate(150%);
+}
+
+.ai-logo {
+    box-shadow:
+        0 10px 24px rgba(99,102,241,.22),
+        0 2px 0 rgba(255,255,255,.78) inset,
+        0 -2px 0 rgba(99,102,241,.12) inset;
+}
+
+.ai-toolbar {
+    gap: 7px;
+    border-bottom-color: rgba(255,255,255,.42);
+    background: rgba(255,255,255,.18);
+    box-shadow: 0 1px 0 rgba(255,255,255,.58) inset;
+}
+
+.ai-toolbar button,
+.ai-settings-btn,
+.ai-question-btn,
+.ai-pure-translate-btn {
+    color: #26354d;
+    border-radius: 13px !important;
+    transition:
+        transform .22s cubic-bezier(.22,1,.36,1),
+        background .3s ease,
+        box-shadow .3s ease,
+        filter .3s ease;
+}
+
+.ai-toolbar button:hover,
+.ai-settings-btn:hover,
+.ai-question-btn:hover,
+.ai-pure-translate-btn:hover {
+    transform: translateY(-2px) scale(1.025);
+    background: rgba(255,255,255,.58) !important;
+    box-shadow:
+        0 14px 26px rgba(15,23,42,.14),
+        0 2px 0 rgba(255,255,255,.84) inset,
+        0 0 20px rgba(125,211,252,.20);
+}
+
+.ai-submenu {
+    background: rgba(242,247,255,.62) !important;
+    border-radius: 15px;
+}
+
+.ai-submenu button {
+    border-radius: 10px !important;
+    color: #26354d;
+}
+
+.ai-submenu button:hover {
+    background: rgba(255,255,255,.70) !important;
+}
+
+.ai-card {
+    border-radius: 16px;
+    border-color: rgba(255,255,255,.66) !important;
+    background: rgba(255,255,255,.40) !important;
+    box-shadow:
+        0 10px 25px rgba(15,23,42,.08),
+        0 2px 0 rgba(255,255,255,.80) inset,
+        0 -1px 0 rgba(148,163,184,.10) inset;
+}
+
+.ai-card:hover {
+    transform: translateY(-2px) scale(1.008);
+    background: rgba(255,255,255,.54) !important;
+}
+
+#ai-settings,
+#ai-question,
+#ai-translation-dialog,
+#ai-pure-translation-dialog {
+    background: rgba(242,247,255,.58) !important;
+    border-radius: 18px;
+    box-shadow:
+        0 20px 44px rgba(15,23,42,.18),
+        0 3px 0 rgba(255,255,255,.84) inset,
+        0 0 0 1px rgba(255,255,255,.35);
+}
+
+#ai-settings input,
+#ai-question-input,
+#ai-translation-input,
+#ai-pure-translation-input {
+    background: rgba(255,255,255,.42);
+    border: 1px solid rgba(255,255,255,.76);
+    box-shadow:
+        0 2px 0 rgba(255,255,255,.74) inset,
+        0 8px 18px rgba(15,23,42,.06);
+    backdrop-filter: blur(15px) saturate(140%);
+    -webkit-backdrop-filter: blur(15px) saturate(140%);
+}
+
+#ai-settings input:focus,
+#ai-question-input:focus,
+#ai-translation-input:focus,
+#ai-pure-translation-input:focus {
+    border-color: rgba(99,102,241,.58);
+    background: rgba(255,255,255,.62);
+    box-shadow:
+        0 0 0 3px rgba(129,140,248,.16),
+        0 2px 0 rgba(255,255,255,.82) inset;
+}
+
+#ai-status {
+    border-left: 0 !important;
+    border-right: 0 !important;
+    border-bottom: 0 !important;
+    border-top-color: rgba(255,255,255,.52) !important;
+    background: rgba(255,255,255,.28) !important;
+}
+
+/* 仅在悬停时呼吸变色，空闲时保持稳定。 */
+#ai-translator-ball {
+    animation: none;
+    background-size: 180% 180%;
+    border-color: rgba(255,255,255,.86);
+    box-shadow:
+        0 12px 30px rgba(79,70,229,.30),
+        0 2px 0 rgba(255,255,255,.72) inset,
+        0 -2px 0 rgba(15,23,42,.12) inset;
+}
+
+#ai-translator-ball:hover {
+    animation: ai-ball-glass-breathe 1.85s ease-in-out infinite;
+    background-size: 130% 130%;
+    filter: saturate(1.28) brightness(1.05);
+}
+
+#ai-translator-container.ai-open #ai-translator-ball:hover {
+    animation: ai-ball-glass-breathe 1.85s ease-in-out infinite;
+}
+
+#ai-translator-ball:hover::before {
+    animation: ai-ball-glass-glow 1.85s ease-in-out infinite;
+}
+
+@keyframes ai-ball-glass-breathe {
+    0%, 100% {
+        background-position: 0% 48%;
+        box-shadow: 0 12px 30px rgba(79,70,229,.30), 0 2px 0 rgba(255,255,255,.72) inset;
+    }
+    50% {
+        background-position: 100% 52%;
+        box-shadow: 0 0 0 7px rgba(236,72,153,.12), 0 18px 42px rgba(217,70,239,.42), 0 2px 0 rgba(255,255,255,.86) inset;
+    }
+}
+
+@keyframes ai-ball-glass-glow {
+    0%, 100% { opacity: .48; transform: scale(.98); }
+    50% { opacity: .96; transform: scale(1.18); }
+}
+
+/* 透明度校正：让下层黑洞、卡片和动画可以透过上层玻璃被看见。 */
+#ai-translator-panel {
+    background: rgba(216, 231, 255, .24) !important;
+    backdrop-filter: blur(28px) saturate(128%);
+    -webkit-backdrop-filter: blur(28px) saturate(128%);
+    box-shadow:
+        0 24px 70px rgba(15,23,42,.20),
+        0 2px 0 rgba(255,255,255,.46) inset,
+        0 0 0 1px rgba(255,255,255,.28);
+}
+
+#ai-translator-panel::before {
+    background:
+        radial-gradient(circle at 10% 0%, rgba(255,255,255,.28), transparent 30%),
+        radial-gradient(circle at 90% 100%, rgba(167,139,250,.08), transparent 34%),
+        linear-gradient(135deg, rgba(255,255,255,.14), rgba(255,255,255,.025) 48%, rgba(125,211,252,.08));
+    box-shadow: 0 0 0 1px rgba(255,255,255,.16) inset;
+}
+
+.ai-header {
+    background: rgba(226, 238, 255, .22) !important;
+    border-bottom-color: rgba(255,255,255,.30);
+}
+
+.ai-toolbar {
+    background: rgba(226, 238, 255, .16) !important;
+    border-bottom-color: rgba(255,255,255,.26);
+}
+
+#ai-content {
+    background: rgba(226, 238, 255, .14) !important;
+}
+
+.ai-toolbar button,
+.ai-settings-btn,
+.ai-question-btn,
+.ai-pure-translate-btn {
+    background: rgba(255,255,255,.24) !important;
+    box-shadow:
+        0 8px 20px rgba(15,23,42,.07),
+        0 1px 0 rgba(255,255,255,.54) inset,
+        0 0 0 1px rgba(255,255,255,.16);
+}
+
+.ai-toolbar button:hover,
+.ai-settings-btn:hover,
+.ai-question-btn:hover,
+.ai-pure-translate-btn:hover {
+    background: rgba(255,255,255,.38) !important;
+}
+
+.ai-submenu {
+    background: rgba(224, 236, 255, .32) !important;
+}
+
+.ai-submenu button {
+    background: rgba(255,255,255,.20) !important;
+}
+
+.ai-submenu button:hover {
+    background: rgba(255,255,255,.42) !important;
+}
+
+.ai-card {
+    background: rgba(255,255,255,.23) !important;
+    box-shadow:
+        0 9px 22px rgba(15,23,42,.06),
+        0 1px 0 rgba(255,255,255,.58) inset,
+        0 0 0 1px rgba(255,255,255,.14);
+}
+
+.ai-card:hover {
+    background: rgba(255,255,255,.32) !important;
+}
+
+#ai-settings,
+#ai-question,
+#ai-translation-dialog,
+#ai-pure-translation-dialog {
+    background: rgba(220, 234, 255, .34) !important;
+    backdrop-filter: blur(24px) saturate(128%);
+    -webkit-backdrop-filter: blur(24px) saturate(128%);
+    box-shadow:
+        0 20px 44px rgba(15,23,42,.14),
+        0 2px 0 rgba(255,255,255,.60) inset,
+        0 0 0 1px rgba(255,255,255,.18);
+}
+
+#ai-settings input,
+#ai-question-input,
+#ai-translation-input,
+#ai-pure-translation-input {
+    background: rgba(255,255,255,.25) !important;
+}
+
+#ai-settings input:focus,
+#ai-question-input:focus,
+#ai-translation-input:focus,
+#ai-pure-translation-input:focus {
+    background: rgba(255,255,255,.36) !important;
+}
+
+#ai-status {
+    background: rgba(226, 238, 255, .20) !important;
+}
+
+/* 分析时仅保留沿窗口圆角边界的顺时针流光，状态文字保持静止。 */
+#ai-status.ai-working #ai-status-text {
+    animation: none !important;
+}
+
+#ai-status.ai-working::after {
+    content: none !important;
+    animation: none !important;
+}
+
+.ai-edge-light {
+    position: absolute;
+    inset: 0;
+    z-index: 4;
+    pointer-events: none;
+    opacity: 0;
+    overflow: hidden;
+    border-radius: 18px;
+    transition: opacity .2s ease;
+    filter: saturate(1.24) brightness(1.12);
+    contain: layout style paint;
+}
+
+.ai-edge-light-pixel {
+    position: absolute;
+    width: 3px;
+    height: 3px;
+    border-radius: 50%;
+    background: #00e5ff;
+    box-shadow:
+        0 0 5px rgba(34,211,238,.82),
+        0 0 12px rgba(129,140,248,.52),
+        0 0 20px rgba(167,139,250,.22);
+    transform: translate(-50%, -50%) scale(var(--edge-light-scale, 1));
+}
+
+#ai-translator-container.ai-open.ai-thinking .ai-edge-light {
+    opacity: .96;
+}
+
+/* 彩色助手标识：保留玻璃边缘和高光，但避免后续玻璃通用样式将其洗成白色。 */
+.ai-logo {
+    position: relative;
+    overflow: hidden;
+    color: #fff !important;
+    background:
+        conic-gradient(
+            from 210deg,
+            #00f5d4,
+            #00bbf9,
+            #6366f1,
+            #a855f7,
+            #f15bb5,
+            #fee440,
+            #00f5d4
+        ) !important;
+    background-size: 180% 180%;
+    border: 1px solid rgba(255,255,255,.78) !important;
+    box-shadow:
+        0 10px 22px rgba(99,102,241,.24),
+        0 2px 0 rgba(255,255,255,.76) inset,
+        0 -2px 0 rgba(15,23,42,.12) inset,
+        0 0 18px rgba(34,211,238,.18);
+}
+
+.ai-logo::after {
+    content: '';
+    position: absolute;
+    inset: 3px;
+    border-radius: 8px;
+    border: 1px solid rgba(255,255,255,.44);
+    background:
+        linear-gradient(
+            135deg,
+            rgba(255,255,255,.34),
+            transparent 42%,
+            rgba(255,255,255,.08)
+        );
+    pointer-events: none;
+}
+
+/* 悬浮球 hover 使用多段缓动的连续色彩流动，避免颜色在两个端点之间生硬切换。 */
+#ai-translator-ball:hover,
+#ai-translator-container.ai-open #ai-translator-ball:hover {
+    animation: ai-ball-color-breathe 3.6s ease-in-out infinite;
+    background-size: 220% 220%;
+    filter: saturate(1.18) brightness(1.06);
+}
+
+@keyframes ai-ball-color-breathe {
+    0%, 100% {
+        background-position: 0% 48%;
+        filter: saturate(1.12) brightness(1.02) hue-rotate(0deg);
+        box-shadow: 0 12px 30px rgba(79,70,229,.30), 0 2px 0 rgba(255,255,255,.72) inset;
+    }
+    25% {
+        background-position: 34% 50%;
+        filter: saturate(1.18) brightness(1.06) hue-rotate(8deg);
+        box-shadow: 0 0 0 4px rgba(34,211,238,.10), 0 15px 34px rgba(79,70,229,.34), 0 2px 0 rgba(255,255,255,.78) inset;
+    }
+    50% {
+        background-position: 70% 52%;
+        filter: saturate(1.24) brightness(1.10) hue-rotate(16deg);
+        box-shadow: 0 0 0 7px rgba(236,72,153,.10), 0 18px 40px rgba(168,85,247,.38), 0 2px 0 rgba(255,255,255,.84) inset;
+    }
+    75% {
+        background-position: 100% 49%;
+        filter: saturate(1.18) brightness(1.06) hue-rotate(8deg);
+        box-shadow: 0 0 0 4px rgba(129,140,248,.10), 0 15px 34px rgba(99,102,241,.34), 0 2px 0 rgba(255,255,255,.78) inset;
+    }
+}
+
+`;
+
+    document.documentElement
+        .appendChild(style);
+
+    // =========================================================
+    // 创建界面
+    // =========================================================
+
+    const container =
+        document.createElement('div');
+
+    container.id =
+        'ai-translator-container';
+
+    container.innerHTML = `
+<div id="ai-translator-panel">
+
+    <div class="ai-edge-light" aria-hidden="true"></div>
+
+    <div class="ai-blackhole-cover" aria-hidden="true">
+        <div class="ai-blackhole-particles"></div>
+        <span class="ai-blackhole-core"></span>
+    </div>
+
+    <div class="ai-header">
+
+        <div class="ai-logo">
+            A
+        </div>
+
+        <div class="ai-header-text">
+
+            <div class="ai-title">
+                中英智能助手
+            </div>
+
+            <div class="ai-subtitle">
+                TRANSLATION · SENTENCE ANALYSIS
+            </div>
+
+        </div>
+
+        <button
+            class="ai-pure-translate-btn"
+            id="ai-pure-translate-btn"
+            title="纯翻译"
+            aria-label="纯翻译"
+        >
+            文
+        </button>
+
+        <button
+            class="ai-question-btn"
+            id="ai-question-btn"
+            title="提问英语问题"
+            aria-label="提问英语问题"
+        >
+            ?
+        </button>
+
+        <button
+            class="ai-settings-btn"
+            id="ai-settings-btn"
+        >
+            ⚙ 设置
+        </button>
+
+    </div>
+
+    <div class="ai-toolbar">
+
+        <button
+            class="ai-btn-translate"
+            id="ai-translate"
+            title="单词与短语翻译"
+        >
+            ◉
+        </button>
+
+        <div class="ai-menu" id="ai-sentence-menu">
+            <button class="ai-btn-quick" title="句子分析">⚡</button>
+            <div class="ai-submenu">
+                <button id="ai-quick-analysis">⚡ 快速分析</button>
+                <button id="ai-analysis">◈ 详细分析</button>
+            </div>
+        </div>
+
+        <div class="ai-menu" id="ai-article-menu">
+            <button class="ai-btn-analysis" title="文章分析">📚</button>
+            <div class="ai-submenu">
+                <button id="ai-article-quick">📝 文章快析</button>
+                <button id="ai-article-analysis">📚 文章详析</button>
+            </div>
+        </div>
+
+        <button
+            class="ai-btn-paste"
+            id="ai-paste"
+            title="读取剪贴板"
+        >
+            📋
+        </button>
+
+        <button
+            class="ai-btn-copy"
+            id="ai-copy"
+            title="复制结果"
+        >
+            ⧉
+        </button>
+
+        <button
+            class="ai-btn-clear"
+            id="ai-clear"
+            title="清空"
+        >
+            ×
+        </button>
+
+    </div>
+
+    <div id="ai-content">
+
+        <div class="ai-card">
+
+            <div class="ai-label">
+
+                <span
+                    class="ai-dot
+                    ai-dot-purple"
+                ></span>
+
+                使用说明
+
+            </div>
+
+            <div class="ai-text">单击悬浮球打开，再单击关闭。
+点击 ◉ 打开单词与短语翻译输入框。
+◉ 单词与短语翻译
+⚡ 快速分析
+◈ 详细分析
+📝 文章快析（先读取剪贴板）
+📚 文章详析（先读取剪贴板）
+📋 读取剪贴板</div>
+
+        </div>
+
+    </div>
+
+    <div id="ai-status">
+
+        <span
+            class="ai-status-indicator"
+        >
+
+            <span
+                id="ai-status-icon"
+                class="ai-status-dot"
+            ></span>
+
+        </span>
+
+        <span id="ai-status-text">
+            准备就绪
+        </span>
+
+    </div>
+
+    <div id="ai-translation-dialog">
+        <div class="ai-translation-title">◉ 单词与短语翻译</div>
+        <textarea id="ai-translation-input" placeholder="请输入或粘贴一个中文/英文单词或短语……"></textarea>
+        <div class="ai-translation-actions">
+            <button class="ai-translation-paste" id="ai-translation-paste">📋 粘贴</button>
+            <button class="ai-translation-speak" id="ai-translation-speak" title="朗读英文词条">🔊</button>
+            <button class="ai-translation-favorite" id="ai-translation-favorite" title="收藏当前词条">☆</button>
+            <button class="ai-translation-batch" id="ai-translation-batch" title="逐行快速查询">批量</button>
+            <button class="ai-translation-batch" id="ai-translation-favorites" title="查看收藏词条">收藏</button>
+            <button class="ai-translation-cancel" id="ai-translation-cancel">取消</button>
+            <button class="ai-translation-detail" id="ai-translation-detail">详细翻译</button>
+            <button class="ai-translation-submit" id="ai-translation-submit">快速翻译</button>
+        </div>
+    </div>
+
+    <div id="ai-pure-translation-dialog">
+        <div class="ai-translation-title">文 纯翻译</div>
+        <textarea id="ai-pure-translation-input" placeholder="打开时自动读取剪贴板；支持中文或英文单词、句子和文章……"></textarea>
+        <div class="ai-translation-actions">
+            <button class="ai-translation-paste" id="ai-pure-translation-paste">📋 粘贴</button>
+            <button class="ai-translation-cancel" id="ai-pure-translation-cancel">取消</button>
+            <button class="ai-pure-translation-submit" id="ai-pure-translation-submit">仅翻译</button>
+        </div>
+    </div>
+
+    <div id="ai-question">
+        <div class="ai-question-title">？ 英语提问</div>
+        <textarea id="ai-question-input" placeholder="例如：What is the difference between say and tell?"></textarea>
+        <div class="ai-question-actions">
+            <button class="ai-question-new" id="ai-question-new">新建对话</button>
+            <button class="ai-question-cancel" id="ai-question-cancel">取消</button>
+            <button class="ai-question-submit" id="ai-question-submit">发送问题</button>
+        </div>
+    </div>
+
+    <div id="ai-settings">
+
+        <div class="ai-setting-title">
+            ⚙ API 设置
+        </div>
+
+        <label>
+            API Key
+        </label>
+
+        <input
+            id="ai-api-key"
+            type="password"
+            placeholder="请输入 API Key"
+        >
+
+        <label>
+            Base URL
+        </label>
+
+        <input
+            id="ai-base-url"
+            type="text"
+        >
+
+        <label>
+            模型
+        </label>
+
+        <input
+            id="ai-model"
+            type="text"
+        >
+
+        <div class="ai-setting-actions">
+
+            <button
+                class="ai-cancel"
+                id="ai-cancel"
+            >
+                取消
+            </button>
+
+            <button
+                class="ai-save"
+                id="ai-save"
+            >
+                保存设置
+            </button>
+
+        </div>
+
+    </div>
+
+</div>
+
+<div id="ai-translator-ball">
+
+    <div class="ai-ball-inner">
+
+        <svg
+            class="ai-ball-icon"
+            viewBox="0 0 24 24"
+            fill="none"
+            xmlns="http://www.w3.org/2000/svg"
+        >
+
+            <path
+                d="M4 5H14M9 3V5M6 8C7.3 10.3 9.2 12.2 12 13.5M11 8C10 11.6 7.7 14.3 4.5 16"
+                stroke="currentColor"
+                stroke-width="1.8"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+            />
+
+            <path
+                d="M15 19L18 11L21 19M16.1 16H19.9"
+                stroke="currentColor"
+                stroke-width="1.8"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+            />
+
+        </svg>
+
+    </div>
+
+</div>
+`;
+
+    (
+        document.body ||
+        document.documentElement
+    ).appendChild(
+        container
+    );
+
+    const particleRing = container.querySelector('.ai-blackhole-particles');
+    if (particleRing) {
+        const particleCount = 336;
+        for (let i = 0; i < particleCount; i += 1) {
+            // 以椭圆为边界，但让每颗粒子的初始角度、半径、大小和速度略有差异。
+            const angle = Math.random() * Math.PI * 2;
+            const radiusX = 108 + Math.random() * 19;
+            const radiusY = 34 + Math.random() * 13;
+            const x = 129 + Math.cos(angle) * radiusX;
+            const y = 73 + Math.sin(angle) * radiusY;
+            const size = 1.5 + Math.random() * 3.5;
+            const opacity = .42 + Math.random() * .52;
+            const particle = document.createElement('span');
+            particle.className = 'ai-blackhole-particle';
+            particle.style.left = '0px';
+            particle.style.top = '0px';
+            particle.style.transform = `translate3d(${x.toFixed(2)}px, ${y.toFixed(2)}px, 0) translate(-50%, -50%)`;
+            particle.style.width = `${size.toFixed(2)}px`;
+            particle.style.height = `${size.toFixed(2)}px`;
+            particle.style.opacity = opacity.toFixed(2);
+            particleRing.appendChild(particle);
+            particleOrbitItems.push({
+                element: particle,
+                angle,
+                radiusX,
+                radiusY,
+                speed: .78 + Math.random() * .46
+            });
+        }
+    }
+
+    function edgeLightColor(progress) {
+        const stops = [
+            [0, [244, 254, 255]],
+            [.32, [125, 232, 244]],
+            [.68, [131, 154, 239]],
+            [1, [177, 163, 232]]
+        ];
+        for (let index = 1; index < stops.length; index += 1) {
+            if (progress <= stops[index][0]) {
+                const start = stops[index - 1];
+                const end = stops[index];
+                const ratio = (progress - start[0]) / (end[0] - start[0]);
+                const color = start[1].map((channel, channelIndex) =>
+                    Math.round(channel + (end[1][channelIndex] - channel) * ratio)
+                );
+                return `rgb(${color.join(',')})`;
+            }
+        }
+        return 'rgb(177,163,232)';
+    }
+
+    const edgeLight = container.querySelector('.ai-edge-light');
+    if (edgeLight) {
+        const pixelCount = 180;
+        for (let i = 0; i < pixelCount; i += 1) {
+            const tailProgress = i / (pixelCount - 1);
+            const pixel = document.createElement('span');
+            pixel.className = 'ai-edge-light-pixel';
+            pixel.style.opacity = Math.min(1, Math.pow(1 - tailProgress, .68) * 1.12 + .06).toFixed(3);
+            pixel.style.setProperty('--edge-light-scale', (1.34 - tailProgress * .78).toFixed(3));
+            pixel.style.background = edgeLightColor(tailProgress);
+            edgeLight.appendChild(pixel);
+            edgeLightItems.push({
+                element: pixel,
+                scale: (1.34 - tailProgress * .78).toFixed(3)
+            });
+        }
+    }
+
+    function getEdgeLightPoint(distance) {
+        const width = panel.clientWidth || PANEL_WIDTH;
+        const height = panel.clientHeight || Math.min(window.innerHeight * .5, 560);
+        const inset = 1.2;
+        const radius = Math.min(18, width / 2, height / 2);
+        const left = inset;
+        const right = width - inset;
+        const top = inset;
+        const bottom = height - inset;
+        const horizontal = Math.max(0, width - 2 * inset - 2 * radius);
+        const vertical = Math.max(0, height - 2 * inset - 2 * radius);
+        const quarterArc = Math.PI * radius / 2;
+        const bottomHalf = Math.max(0, width / 2 - left - radius);
+        const perimeter =
+            bottomHalf +
+            quarterArc +
+            vertical +
+            quarterArc +
+            horizontal +
+            quarterArc +
+            vertical +
+            quarterArc +
+            bottomHalf;
+
+        let remaining = ((distance % perimeter) + perimeter) % perimeter;
+
+        if (remaining < bottomHalf) {
+            return { x: width / 2 - remaining, y: bottom };
+        }
+        remaining -= bottomHalf;
+
+        if (remaining < quarterArc) {
+            const angle = Math.PI / 2 + remaining / radius;
+            return {
+                x: left + radius + Math.cos(angle) * radius,
+                y: bottom - radius + Math.sin(angle) * radius
+            };
+        }
+        remaining -= quarterArc;
+
+        if (remaining < vertical) {
+            return { x: left, y: bottom - radius - remaining };
+        }
+        remaining -= vertical;
+
+        if (remaining < quarterArc) {
+            const angle = Math.PI + remaining / radius;
+            return {
+                x: left + radius + Math.cos(angle) * radius,
+                y: top + radius + Math.sin(angle) * radius
+            };
+        }
+        remaining -= quarterArc;
+
+        if (remaining < horizontal) {
+            return { x: left + radius + remaining, y: top };
+        }
+        remaining -= horizontal;
+
+        if (remaining < quarterArc) {
+            const angle = Math.PI * 1.5 + remaining / radius;
+            return {
+                x: right - radius + Math.cos(angle) * radius,
+                y: top + radius + Math.sin(angle) * radius
+            };
+        }
+        remaining -= quarterArc;
+
+        if (remaining < vertical) {
+            return { x: right, y: top + radius + remaining };
+        }
+        remaining -= vertical;
+
+        if (remaining < quarterArc) {
+            const angle = remaining / radius;
+            return {
+                x: right - radius + Math.cos(angle) * radius,
+                y: bottom - radius + Math.sin(angle) * radius
+            };
+        }
+        remaining -= quarterArc;
+        return { x: right - radius - remaining, y: bottom };
+    }
+
+    function renderEdgeLight() {
+        if (!edgeLightItems.length) return;
+        const spacing = (panel.clientWidth || PANEL_WIDTH) / Math.max(1, edgeLightItems.length - 1);
+        edgeLightItems.forEach((item, index) => {
+            const point = getEdgeLightPoint(edgeLightDistance - index * spacing);
+            item.element.style.transform =
+                `translate3d(${point.x.toFixed(2)}px, ${point.y.toFixed(2)}px, 0) translate(-50%, -50%) scale(${item.scale})`;
+        });
+    }
+
+    function updateVisualAnimations(timestamp) {
+        if (!visualActive) return;
+        if (document.hidden || reducedMotionQuery.matches) {
+            visualActive = false;
+            visualLastTime = 0;
+            visualAccumulator = 0;
+            visualAnimation = 0;
+            return;
+        }
+        const elapsed = visualLastTime
+            ? Math.min(timestamp - visualLastTime, 50)
+            : 16;
+        visualLastTime = timestamp;
+        visualAccumulator += elapsed;
+
+        // 约 45fps 更新位置，避免 500 多个节点每帧触发布局计算。
+        if (visualAccumulator >= visualFrameInterval) {
+            const frameElapsed = visualAccumulator;
+            visualAccumulator = 0;
+
+            if (particleOrbitActive) {
+                // 正值角度在屏幕坐标系中顺时针推进，轨道本身保持固定倾角。
+                particleOrbitAngle += frameElapsed * .00115;
+                particleOrbitItems.forEach(item => {
+                    const angle = item.angle + particleOrbitAngle * item.speed;
+                    const x = 129 + Math.cos(angle) * item.radiusX;
+                    const y = 73 + Math.sin(angle) * item.radiusY;
+                    item.element.style.transform =
+                        `translate3d(${x.toFixed(2)}px, ${y.toFixed(2)}px, 0) translate(-50%, -50%)`;
+                });
+            }
+
+            if (edgeLightActive) {
+                // 路径从底部中点开始，正距离依次经过左、上、右、下边，形成顺时针闭环。
+                edgeLightDistance += frameElapsed * .26;
+                renderEdgeLight();
+            }
+        }
+
+        visualAnimation = requestAnimationFrame(updateVisualAnimations);
+    }
+
+    function ensureVisualAnimation() {
+        if (reducedMotionQuery.matches || document.hidden) return false;
+        if (visualActive) return true;
+        visualActive = true;
+        visualLastTime = 0;
+        visualAccumulator = 0;
+        visualAnimation = requestAnimationFrame(updateVisualAnimations);
+        return true;
+    }
+
+    function stopVisualAnimationIfIdle() {
+        if (particleOrbitActive || edgeLightActive) return;
+        visualActive = false;
+        visualLastTime = 0;
+        visualAccumulator = 0;
+        if (visualAnimation) {
+            cancelAnimationFrame(visualAnimation);
+            visualAnimation = 0;
+        }
+    }
+
+    function startEdgeLight() {
+        if (edgeLightActive || !edgeLightItems.length) return;
+        edgeLightActive = true;
+        edgeLightDistance = 0;
+        ensureVisualAnimation();
+        renderEdgeLight();
+    }
+
+    function stopEdgeLight() {
+        edgeLightActive = false;
+        stopVisualAnimationIfIdle();
+    }
+
+    function startParticleOrbit() {
+        if (particleOrbitActive || !particleOrbitItems.length) return;
+        particleOrbitActive = true;
+        ensureVisualAnimation();
+    }
+
+    function stopParticleOrbit() {
+        particleOrbitActive = false;
+        stopVisualAnimationIfIdle();
+    }
+
+    document.addEventListener('visibilitychange', () => {
+        if (!document.hidden && (particleOrbitActive || edgeLightActive)) {
+            ensureVisualAnimation();
+            renderEdgeLight();
+        }
+    });
+
+    // =========================================================
+    // 获取 DOM
+    // =========================================================
+
+    const ball =
+        document.getElementById(
+            'ai-translator-ball'
+        );
+
+    const panel =
+        document.getElementById(
+            'ai-translator-panel'
+        );
+
+    const content =
+        document.getElementById(
+            'ai-content'
+        );
+
+    const statusBox =
+        document.getElementById(
+            'ai-status'
+        );
+
+    const statusText =
+        document.getElementById(
+            'ai-status-text'
+        );
+
+    const statusIcon =
+        document.getElementById(
+            'ai-status-icon'
+        );
+
+    const settingsPanel =
+        document.getElementById(
+            'ai-settings'
+        );
+
+    const questionPanel =
+        document.getElementById(
+            'ai-question'
+        );
+
+    const translationDialog =
+        document.getElementById(
+            'ai-translation-dialog'
+        );
+
+    const pureTranslationDialog =
+        document.getElementById(
+            'ai-pure-translation-dialog'
+        );
+
+    const resizeHandle = document.createElement('div');
+    resizeHandle.id = 'ai-resize-handle';
+    resizeHandle.title = '向下拖动，调整面板高度';
+    panel.appendChild(resizeHandle);
+
+    const savedPanelHeight = Number(GM_getValue('translator_panel_height', 0));
+    if (savedPanelHeight >= 360) {
+        panel.style.height = `${Math.min(savedPanelHeight, window.innerHeight - 16)}px`;
+    }
+
+    // =========================================================
+    // 状态系统
+    // =========================================================
+
+    function setStatus(
+        text,
+        type = 'ready'
+    ) {
+        statusText.textContent =
+            text;
+
+        statusBox.classList.remove('ai-status-flash');
+        void statusBox.offsetWidth;
+        statusBox.classList.add('ai-status-flash');
+
+        statusBox
+            .classList
+            .remove(
+                'ai-working',
+                'ai-success',
+                'ai-error'
+        );
+        container.classList.toggle(
+            'ai-thinking',
+            type === 'working'
+        );
+        if (type === 'working') {
+            startParticleOrbit();
+            startEdgeLight();
+        } else {
+            stopParticleOrbit();
+            stopEdgeLight();
+        }
+        statusIcon
+            .removeAttribute(
+                'style'
+            );
+
+        if (
+            type === 'working'
+        ) {
+            statusBox
+                .classList
+                .add(
+                    'ai-working'
+                );
+
+            statusIcon.className =
+                'ai-status-spinner';
+
+            return;
+        }
+
+        statusIcon.className =
+            'ai-status-dot';
+
+        if (
+            type === 'success'
+        ) {
+            statusBox
+                .classList
+                .add(
+                    'ai-success'
+                );
+
+            statusIcon.style.background =
+                '#22c55e';
+
+            statusIcon.style.boxShadow =
+                '0 0 0 4px rgba(34,197,94,.14)';
+
+            return;
+        }
+
+        if (
+            type === 'error'
+        ) {
+            statusBox
+                .classList
+                .add(
+                    'ai-error'
+                );
+
+            statusIcon.style.background =
+                '#ef4444';
+
+            statusIcon.style.boxShadow =
+                '0 0 0 4px rgba(239,68,68,.14)';
+
+            return;
+        }
+
+        statusIcon.style.background =
+            '#22c55e';
+
+        statusIcon.style.boxShadow =
+            '0 0 0 4px rgba(34,197,94,.14)';
+    }
+
+    // =========================================================
+    // 悬浮球位置
+    // =========================================================
+
+    const savedX =
+        GM_getValue(
+            'translator_ball_x',
+            window.innerWidth - 75
+        );
+
+    const savedY =
+        GM_getValue(
+            'translator_ball_y',
+            Math.round(
+                window.innerHeight * 0.35
+            )
+        );
+
+    function setContainerPosition(
+        x,
+        y
+    ) {
+        const maxX =
+            window.innerWidth -
+            BALL_SIZE;
+
+        const maxY =
+            window.innerHeight -
+            BALL_SIZE;
+
+        x =
+            Math.max(
+                0,
+                Math.min(
+                    Number(x) || 0,
+                    maxX
+                )
+            );
+
+        y =
+            Math.max(
+                0,
+                Math.min(
+                    Number(y) || 0,
+                    maxY
+                )
+            );
+
+        container.style.left =
+            x + 'px';
+
+        container.style.top =
+            y + 'px';
+
+        container.style.right =
+            'auto';
+
+        return {
+            x,
+            y
+        };
+    }
+
+    setContainerPosition(
+        savedX,
+        savedY
+    );
+
+    // =========================================================
+    // 面板展开方向
+    // =========================================================
+
+    function updatePanelDirection() {
+        const rect =
+            ball
+                .getBoundingClientRect();
+
+        if (
+            rect.left >
+            PANEL_WIDTH + 25
+        ) {
+            panel.style.right =
+                '56px';
+
+            panel.style.left =
+                'auto';
+        } else {
+            panel.style.left =
+                '56px';
+
+            panel.style.right =
+                'auto';
+        }
+
+        const panelHeight =
+            panel.getBoundingClientRect().height ||
+            Math.min(
+                window.innerHeight * 0.5,
+                560
+            );
+
+        if (
+            rect.top +
+            panelHeight >
+            window.innerHeight
+        ) {
+            panel.style.top =
+                'auto';
+
+            panel.style.bottom =
+                '0';
+        } else {
+            panel.style.top =
+                '0';
+
+            panel.style.bottom =
+                'auto';
+        }
+    }
+
+    // =========================================================
+    // 面板开关
+    // =========================================================
+
+    function openPanel() {
+        updatePanelDirection();
+
+        container
+            .classList
+            .add(
+                'ai-open'
+            );
+
+        panelOpen = true;
+    }
+
+    function closePanel() {
+        settingsPanel
+            .style
+            .display =
+                'none';
+
+        questionPanel.style.display = 'none';
+        translationDialog.style.display = 'none';
+        pureTranslationDialog.style.display = 'none';
+
+        container
+            .classList
+            .remove(
+                'ai-open'
+            );
+
+        panelOpen = false;
+    }
+
+    function togglePanel() {
+        if (panelOpen) {
+            closePanel();
+        } else {
+            openPanel();
+        }
+    }
+
+    function hideInputPanels() {
+        settingsPanel.style.display = 'none';
+        questionPanel.style.display = 'none';
+        translationDialog.style.display = 'none';
+        pureTranslationDialog.style.display = 'none';
+    }
+
+    // 按钮点击涟漪反馈
+    panel.addEventListener('click', event => {
+        const btn = event.target.closest('button');
+        if (!btn || !panel.contains(btn)) return;
+        const rect = btn.getBoundingClientRect();
+        const size = Math.max(rect.width, rect.height);
+        const ripple = document.createElement('span');
+        ripple.className = 'ai-ripple';
+        ripple.style.width = ripple.style.height = size + 'px';
+        ripple.style.left = (event.clientX - rect.left - size / 2) + 'px';
+        ripple.style.top = (event.clientY - rect.top - size / 2) + 'px';
+        btn.appendChild(ripple);
+        setTimeout(() => ripple.remove(), 600);
+    });
+
+    // =========================================================
+    // 拖动悬浮球
+    // =========================================================
+
+    let dragging = false;
+    let moved = false;
+
+    let startMouseX = 0;
+    let startMouseY = 0;
+
+    let startX = 0;
+    let startY = 0;
+
+    ball.addEventListener(
+        'mousedown',
+        event => {
+
+            if (
+                event.button !== 0
+            ) {
+                return;
+            }
+
+            dragging = true;
+            moved = false;
+
+            startMouseX =
+                event.clientX;
+
+            startMouseY =
+                event.clientY;
+
+            const rect =
+                container
+                    .getBoundingClientRect();
+
+            startX = rect.left;
+            startY = rect.top;
+
+            // 在悬浮球获得焦点前最后尝试保存页面选区；
+            // 浏览器内置 PDF 阅读器可能会在随后清除选区。
+            rememberSelection();
+
+            event.preventDefault();
+        }
+    );
+
+    document.addEventListener(
+        'mousemove',
+        event => {
+
+            if (!dragging) {
+                return;
+            }
+
+            const dx =
+                event.clientX -
+                startMouseX;
+
+            const dy =
+                event.clientY -
+                startMouseY;
+
+            if (
+                Math.abs(dx) > 4 ||
+                Math.abs(dy) > 4
+            ) {
+                moved = true;
+                container.classList.add('ai-dragging');
+            }
+
+            const position =
+                setContainerPosition(
+                    startX + dx,
+                    startY + dy
+                );
+
+            updatePanelDirection();
+
+            GM_setValue(
+                'translator_ball_x',
+                position.x
+            );
+
+            GM_setValue(
+                'translator_ball_y',
+                position.y
+            );
+        }
+    );
+
+    document.addEventListener(
+        'mouseup',
+        () => {
+            dragging = false;
+            container.classList.remove('ai-dragging');
+        }
+    );
+
+    let resizing = false;
+    let resizeStartY = 0;
+    let resizeStartHeight = 0;
+
+    resizeHandle.addEventListener('mousedown', event => {
+        if (event.button !== 0) return;
+        resizing = true;
+        resizeStartY = event.clientY;
+        resizeStartHeight = panel.getBoundingClientRect().height;
+        event.preventDefault();
+        event.stopPropagation();
+    });
+
+    document.addEventListener('mousemove', event => {
+        if (!resizing) return;
+        const panelRect = panel.getBoundingClientRect();
+        const availableHeight = panel.style.top === 'auto'
+            ? Math.max(360, panelRect.bottom - 8)
+            : Math.max(360, window.innerHeight - panelRect.top - 8);
+        const nextHeight = Math.max(360, Math.min(availableHeight, resizeStartHeight + event.clientY - resizeStartY));
+        panel.style.height = `${nextHeight}px`;
+        updatePanelDirection();
+    });
+
+    document.addEventListener('mouseup', () => {
+        if (resizing) {
+            GM_setValue('translator_panel_height', Math.round(panel.getBoundingClientRect().height));
+        }
+        resizing = false;
+    });
+
+    ball.addEventListener(
+        'click',
+        event => {
+
+            event.stopPropagation();
+
+            if (moved) {
+                moved = false;
+                return;
+            }
+
+            container.classList.remove('ai-gradient-active');
+            void container.offsetWidth;
+            container.classList.add('ai-gradient-active');
+            window.setTimeout(() => container.classList.remove('ai-gradient-active'), 900);
+            togglePanel();
+        }
+    );
+
+    function setupMenu(menuId) {
+        const menu = document.getElementById(menuId);
+        const trigger = menu.querySelector(':scope > button');
+        trigger.addEventListener('click', event => {
+            event.stopPropagation();
+            // 输入/粘贴窗口不能遮挡句子或文章分析菜单。
+            hideInputPanels();
+            openPanel();
+            document.querySelectorAll('.ai-menu.ai-menu-open').forEach(other => {
+                if (other !== menu) other.classList.remove('ai-menu-open');
+            });
+            menu.classList.toggle('ai-menu-open');
+        });
+        menu.querySelector('.ai-submenu').addEventListener('click', event => event.stopPropagation());
+    }
+
+    setupMenu('ai-sentence-menu');
+    setupMenu('ai-article-menu');
+    document.addEventListener('click', () => {
+        document.querySelectorAll('.ai-menu.ai-menu-open').forEach(menu => menu.classList.remove('ai-menu-open'));
+    });
+
+    // =========================================================
+    // 显示输入预览
+    // =========================================================
+
+    function showInputPreview(text) {
+        content.innerHTML = '';
+
+        const card =
+            document.createElement(
+                'div'
+            );
+
+        card.className =
+            'ai-card ai-card-original';
+
+        card.innerHTML = `
+<div class="ai-label">
+    <span
+        class="ai-dot ai-dot-blue"
+    ></span>
+    已读取文本
+</div>
+
+<div class="ai-text"></div>
+`;
+
+        card
+            .querySelector(
+                '.ai-text'
+            )
+            .textContent =
+            text;
+
+        content
+            .appendChild(
+                card
+            );
+
+        openPanel();
+    }
+
+    // =========================================================
+    // 显示结果
+    // =========================================================
+
+    function showResult(
+        original,
+        title,
+        result
+    ) {
+        result =
+            cleanResult(result);
+
+        lastResult =
+            result;
+
+        content.innerHTML =
+            '';
+
+        const originalCard =
+            document.createElement(
+                'div'
+            );
+
+        originalCard.className =
+            'ai-card ai-card-original';
+
+        originalCard.innerHTML = `
+<div class="ai-label">
+    <span
+        class="ai-dot ai-dot-blue"
+    ></span>
+    原文
+</div>
+
+<div class="ai-text"></div>
+`;
+
+        originalCard
+            .querySelector(
+                '.ai-text'
+            )
+            .textContent =
+            original;
+
+        const resultCard =
+            document.createElement(
+                'div'
+            );
+
+        resultCard.className =
+            'ai-card ai-card-result';
+
+        resultCard.innerHTML = `
+<div class="ai-label">
+    <span
+        class="ai-dot ai-dot-purple"
+    ></span>
+
+    <span
+        class="ai-result-title"
+    ></span>
+</div>
+
+<div class="ai-text ai-result-content"></div>
+<div class="ai-result-actions">
+    <button class="ai-result-regenerate">重新生成</button>
+</div>
+`;
+
+        resultCard
+            .querySelector(
+                '.ai-result-title'
+            )
+            .textContent =
+            title;
+
+        const resultContent = resultCard.querySelector('.ai-result-content');
+        const isAnalysisResult = title.includes('分析');
+        const isVocabularyResult =
+            title.includes('单词/短语') ||
+            title.includes('批量词汇');
+        if (isAnalysisResult || isVocabularyResult) {
+            const sections = result.split(/(?=^[一二三四五六七八九十]+、)/m).filter(Boolean);
+            resultContent.innerHTML = '';
+            sections.forEach(section => {
+                const lineBreak = section.indexOf('\n');
+                const heading = lineBreak >= 0 ? section.slice(0, lineBreak) : section;
+                const body = lineBreak >= 0 ? section.slice(lineBreak + 1) : '';
+                const sectionBox = document.createElement('div');
+                sectionBox.className = 'ai-result-section ai-section-collapsed';
+                sectionBox.innerHTML = `<button class="ai-result-section-title"><span></span><span class="ai-result-section-icon">＋</span></button><div class="ai-result-section-body"></div>`;
+                sectionBox.querySelector('.ai-result-section-title span:first-child').textContent = heading;
+                sectionBox.querySelector('.ai-result-section-body').innerHTML = formatResult(body);
+                sectionBox.querySelector('.ai-result-section-title').addEventListener('click', () => {
+                    const collapsed = sectionBox.classList.toggle('ai-section-collapsed');
+                    sectionBox.querySelector('.ai-result-section-icon').textContent = collapsed ? '＋' : '－';
+                });
+                resultContent.appendChild(sectionBox);
+            });
+        } else {
+            resultContent.innerHTML = formatResult(result);
+        }
+
+        resultCard.querySelector('.ai-result-regenerate').addEventListener('click', () => {
+            if (lastRequest) lastRequest();
+        });
+
+        content
+            .appendChild(
+                originalCard
+            );
+
+        content
+            .appendChild(
+                resultCard
+            );
+
+        if (title === '英语问题回答') {
+            const followup = document.createElement('div');
+            followup.className = 'ai-card ai-followup-card';
+            followup.innerHTML = '<div class="ai-label">继续追问</div><div class="ai-text">点击标题栏的“？”可继续当前对话，或新建对话。</div>';
+            content.appendChild(followup);
+        }
+    }
+
+    // =========================================================
+    // 显示错误
+    // =========================================================
+
+    function showError(
+        title,
+        message
+    ) {
+        content.innerHTML =
+            '';
+
+        const card =
+            document.createElement(
+                'div'
+            );
+
+        card.className =
+            'ai-card ai-card-error';
+
+        card.innerHTML = `
+<div class="ai-label"></div>
+<div class="ai-text"></div>
+`;
+
+        card
+            .querySelector(
+                '.ai-label'
+            )
+            .textContent =
+            title;
+
+        card
+            .querySelector(
+                '.ai-text'
+            )
+            .textContent =
+            message;
+
+        content
+            .appendChild(
+                card
+            );
+    }
+
+    // =========================================================
+    // 剪贴板读取
+    // =========================================================
+
+    async function readClipboardText() {
+        try {
+            const text =
+                await navigator
+                    .clipboard
+                    .readText();
+
+            if (!text.trim()) {
+                setStatus(
+                    '剪贴板中没有文本',
+                    'error'
+                );
+
+                return '';
+            }
+
+            clipboardText =
+                text.trim();
+            currentText = clipboardText;
+
+            clipboardTextLoaded = true;
+
+            const translationInput = document.getElementById('ai-translation-input');
+            if (translationInput) {
+                translationInput.value = currentText;
+            }
+
+            showInputPreview(
+                currentText
+            );
+
+            setStatus(
+                '已读取剪贴板文本',
+                'success'
+            );
+
+            return currentText;
+        } catch {
+            setStatus(
+                '无法读取剪贴板，请检查浏览器剪贴板权限',
+                'error'
+            );
+
+            return '';
+        }
+    }
+
+    // =========================================================
+    // 单词与短语翻译
+    // =========================================================
+
+    async function translateText(text, detail = false) {
+        if (requestBusy) {
+            setStatus(
+                '当前已有请求正在处理中',
+                'working'
+            );
+            return;
+        }
+
+        if (!text) {
+            setStatus('请输入或粘贴需要查询的单词或短语', 'error');
+            return;
+        }
+
+        currentText = text;
+
+        const lang =
+            detectLanguage(text);
+
+        if (
+            lang !== 'zh' &&
+            lang !== 'en'
+        ) {
+            setStatus(
+                '仅支持中文或英文单词、短语查询',
+                'error'
+            );
+
+            openPanel();
+
+            return;
+        }
+
+        requestBusy = true;
+        lastRequest = () => translateText(text, detail);
+
+        openPanel();
+
+        setStatus(
+            detail ? '正在生成详细词汇解析…' : '正在快速翻译词条…',
+            'working'
+        );
+
+        content.innerHTML = `
+<div class="ai-card">
+    <div class="ai-label">
+        ${detail ? '正在详细翻译' : '正在快速翻译'}
+    </div>
+
+    <div class="ai-text">
+        AI 正在生成词条释义与用法…
+    </div>
+</div>
+`;
+
+        try {
+            const result =
+                await requestAPI(
+                    vocabularyPrompt(text, detail),
+                    NORMAL_TIMEOUT
+                );
+
+            showResult(
+                text,
+                detail ? '单词/短语详细翻译' : '单词/短语快速翻译',
+                result
+            );
+
+            setStatus(
+                detail ? '详细翻译完成' : '快速翻译完成',
+                'success'
+            );
+        } catch (error) {
+            if (isCancelledError(error)) return;
+            if (
+                error.message ===
+                'TIMEOUT'
+            ) {
+                setStatus(
+                    '翻译请求超时',
+                    'error'
+                );
+
+                showError(
+                    '翻译失败',
+                    'API 请求超时，请稍后重试。'
+                );
+            } else {
+                setStatus(
+                    '请求失败：' +
+                    error.message,
+                    'error'
+                );
+
+                showError(
+                    '翻译失败',
+                    error.message
+                );
+            }
+        } finally {
+            requestBusy = false;
+        }
+    }
+
+    // =========================================================
+    // 快速分析
+    // =========================================================
+
+    async function quickAnalyze(forcedText = '') {
+        if (typeof forcedText !== 'string') forcedText = '';
+        if (requestBusy) {
+            setStatus(
+                '当前已有请求正在处理中',
+                'working'
+            );
+            return;
+        }
+
+        const text = forcedText || await getSentenceAnalysisText();
+
+        if (!text) {
+            setStatus(
+                '请先选择英文，或点击 📋 读取剪贴板',
+                'error'
+            );
+
+            openPanel();
+
+            return;
+        }
+
+        if (
+            detectLanguage(text) !==
+            'en'
+        ) {
+            setStatus(
+                '快速分析仅支持英文',
+                'error'
+            );
+
+            openPanel();
+
+            return;
+        }
+
+        currentText = text;
+        requestBusy = true;
+        lastRequest = () => quickAnalyze(text);
+
+        openPanel();
+
+        setStatus(
+            '正在快速分析句子结构…',
+            'working'
+        );
+
+        content.innerHTML = `
+<div class="ai-card">
+    <div class="ai-label">
+        快速分析
+    </div>
+
+    <div class="ai-text">
+        正在提取句子主干、关键结构和翻译…
+    </div>
+</div>
+`;
+
+        try {
+            const result =
+                await requestAPI(
+                    quickPrompt(text),
+                    NORMAL_TIMEOUT
+                );
+
+            showResult(
+                text,
+                '快速分析',
+                result
+            );
+
+            setStatus(
+                '快速分析完成',
+                'success'
+            );
+        } catch (error) {
+            if (isCancelledError(error)) return;
+            if (
+                error.message ===
+                'TIMEOUT'
+            ) {
+                setStatus(
+                    '快速分析请求超时',
+                    'error'
+                );
+
+                showError(
+                    '快速分析失败',
+                    'API 请求超时，请稍后重试。'
+                );
+            } else {
+                setStatus(
+                    '请求失败：' +
+                    error.message,
+                    'error'
+                );
+
+                showError(
+                    '快速分析失败',
+                    error.message
+                );
+            }
+        } finally {
+            requestBusy = false;
+        }
+    }
+
+    // =========================================================
+    // 详细分析
+    // =========================================================
+
+    async function detailedAnalyze(forcedText = '') {
+        if (typeof forcedText !== 'string') forcedText = '';
+        if (requestBusy) {
+            setStatus(
+                '当前已有请求正在处理中',
+                'working'
+            );
+            return;
+        }
+
+        const text = forcedText || await getSentenceAnalysisText();
+
+        if (!text) {
+            setStatus(
+                '请先选择英文，或点击 📋 读取剪贴板',
+                'error'
+            );
+
+            openPanel();
+
+            return;
+        }
+
+        if (
+            detectLanguage(text) !==
+            'en'
+        ) {
+            setStatus(
+                '详细分析仅支持英文',
+                'error'
+            );
+
+            openPanel();
+
+            return;
+        }
+
+        currentText = text;
+        requestBusy = true;
+        lastRequest = () => detailedAnalyze(text);
+
+        openPanel();
+
+        setStatus(
+            '正在详细分析，可能需要一些时间…',
+            'working'
+        );
+
+        content.innerHTML = `
+<div class="ai-card">
+    <div class="ai-label">
+        详细分析
+    </div>
+
+    <div class="ai-text">
+        正在分析主干、从句、修饰关系、重点词组和翻译…
+    </div>
+</div>
+`;
+
+        try {
+            const result =
+                await requestAPI(
+                    detailPrompt(text),
+                    DETAIL_TIMEOUT
+                );
+
+            showResult(
+                text,
+                '详细分析',
+                result
+            );
+
+            setStatus(
+                '详细分析完成',
+                'success'
+            );
+
+            requestBusy = false;
+            return;
+        } catch (error) {
+            if (isCancelledError(error)) {
+                requestBusy = false;
+                return;
+            }
+            if (
+                error.message !==
+                'TIMEOUT'
+            ) {
+                setStatus(
+                    '详细分析失败：' +
+                    error.message,
+                    'error'
+                );
+
+                showError(
+                    '详细分析失败',
+                    error.message
+                );
+
+                requestBusy = false;
+                return;
+            }
+        }
+
+        // 第一次超时，自动精简重试
+
+        setStatus(
+            '首次请求超时，正在自动精简重试…',
+            'working'
+        );
+
+        content.innerHTML = `
+<div class="ai-card">
+    <div class="ai-label">
+        自动重试
+    </div>
+
+    <div class="ai-text">
+        首次详细分析超时，正在使用更精简的分析方式重新请求…
+    </div>
+</div>
+`;
+
+        try {
+            const result =
+                await requestAPI(
+                    fallbackPrompt(text),
+                    DETAIL_TIMEOUT
+                );
+
+            showResult(
+                text,
+                '详细分析（精简重试）',
+                result
+            );
+
+            setStatus(
+                '详细分析完成（重试成功）',
+                'success'
+            );
+        } catch (error) {
+            if (isCancelledError(error)) return;
+            if (
+                error.message ===
+                'TIMEOUT'
+            ) {
+                setStatus(
+                    '详细分析连续两次超时',
+                    'error'
+                );
+
+                showError(
+                    '详细分析超时',
+                    '连续两次 API 请求超时。建议使用 ⚡ 快速分析，或缩短一次选中的英文长度。'
+                );
+            } else {
+                setStatus(
+                    '详细分析失败：' +
+                    error.message,
+                    'error'
+                );
+
+                showError(
+                    '详细分析失败',
+                    error.message
+                );
+            }
+        } finally {
+            requestBusy = false;
+        }
+    }
+
+    async function pureTranslateText(text) {
+        if (requestBusy) {
+            setStatus('当前已有请求正在处理中', 'working');
+            return;
+        }
+        const lang = detectLanguage(text);
+        if (!text || (lang !== 'zh' && lang !== 'en')) {
+            setStatus('请输入中文或英文内容', 'error');
+            return;
+        }
+        requestBusy = true;
+        currentText = text;
+        openPanel();
+        setStatus(lang === 'zh' ? '正在翻译：中文 → 英文…' : '正在翻译：英文 → 中文…', 'working');
+        content.innerHTML = '<div class="ai-card"><div class="ai-label">纯翻译</div><div class="ai-text">正在生成翻译结果…</div></div>';
+        lastRequest = () => pureTranslateText(text);
+        try {
+            const result = await requestAPI(pureTranslationPrompt(text, lang), NORMAL_TIMEOUT);
+            showResult(text, lang === 'zh' ? '英文翻译' : '中文翻译', result);
+            setStatus('翻译完成', 'success');
+        } catch (error) {
+            if (isCancelledError(error)) return;
+            setStatus('翻译失败：' + error.message, 'error');
+            showError('翻译失败', error.message === 'TIMEOUT' ? 'API 请求超时，请稍后重试。' : error.message);
+        } finally {
+            requestBusy = false;
+        }
+    }
+
+    async function openPureTranslationDialog() {
+        settingsPanel.style.display = 'none';
+        questionPanel.style.display = 'none';
+        translationDialog.style.display = 'none';
+        pureTranslationDialog.style.display = pureTranslationDialog.style.display === 'block' ? 'none' : 'block';
+        document.querySelectorAll('.ai-menu.ai-menu-open').forEach(m => m.classList.remove('ai-menu-open'));
+        openPanel();
+        if (pureTranslationDialog.style.display !== 'block') return;
+        const input = document.getElementById('ai-pure-translation-input');
+        input.value = await getSelectedOrClipboardText();
+        input.focus();
+    }
+
+    async function articleAnalyze(detail = false, forcedText = '') {
+        if (typeof forcedText !== 'string') forcedText = '';
+        if (requestBusy) {
+            setStatus('当前已有请求正在处理中', 'working');
+            return;
+        }
+
+        if (!forcedText && (!clipboardTextLoaded || !clipboardText)) {
+            setStatus('请先点击 📋 读取剪贴板文章', 'error');
+            openPanel();
+            return;
+        }
+
+        const sourceText = forcedText || clipboardText;
+        if (detectLanguage(sourceText) !== 'en') {
+            setStatus('文章分析仅支持英文文章', 'error');
+            openPanel();
+            return;
+        }
+
+        let text = sourceText;
+        let truncated = false;
+        if (text.length > ARTICLE_MAX_CHARS) {
+            text = text.slice(0, ARTICLE_MAX_CHARS);
+            truncated = true;
+        }
+
+        requestBusy = true;
+        openPanel();
+        setStatus(detail ? '正在详细分析文章结构…' : '正在快速分析文章结构…', 'working');
+        content.innerHTML = `<div class="ai-card"><div class="ai-label">${detail ? '文章详析' : '文章快析'}</div><div class="ai-text">正在分析文章主题、段落结构和逻辑关系…</div></div>`;
+
+        lastRequest = () => articleAnalyze(detail, text);
+        try {
+            const result = await requestAPI(
+                detail ? articleDetailPrompt(text) : articleQuickPrompt(text),
+                detail ? DETAIL_TIMEOUT : NORMAL_TIMEOUT
+            );
+            showResult(text, detail ? '文章详细分析' : '文章快速分析', result);
+            setStatus(truncated ? '分析完成（文章过长，已截取前 30000 个字符）' : '文章分析完成', 'success');
+            if (truncated) {
+                const notice = document.createElement('div');
+                notice.className = 'ai-card ai-card-error';
+                notice.textContent = '提示：原文章超过 30000 个字符，本次仅分析了开头部分。';
+                content.insertBefore(notice, content.firstChild);
+            }
+        } catch (error) {
+            if (isCancelledError(error)) return;
+            setStatus('文章分析失败：' + error.message, 'error');
+            showError('文章分析失败', error.message === 'TIMEOUT' ? 'API 请求超时，请缩短文章后重试。' : error.message);
+        } finally {
+            requestBusy = false;
+        }
+    }
+
+    async function batchTranslateVocabulary() {
+        if (requestBusy) {
+            setStatus('当前已有请求正在处理中', 'working');
+            return;
+        }
+        const input = document.getElementById('ai-translation-input');
+        const entries = [...new Set(input.value.split(/\r?\n|[,，;；]/).map(item => item.trim()).filter(Boolean))].slice(0, 10);
+        if (!entries.length) {
+            setStatus('请每行输入一个单词或短语', 'error');
+            input.focus();
+            updateFavoriteButton();
+            return;
+        }
+        requestBusy = true;
+        translationDialog.style.display = 'none';
+        openPanel();
+        setStatus(`正在批量查询 ${entries.length} 个词条…`, 'working');
+        content.innerHTML = '<div class="ai-card"><div class="ai-label">批量快速翻译</div><div class="ai-text">正在逐条生成释义…</div></div>';
+        lastRequest = batchTranslateVocabulary;
+        const results = [];
+        try {
+            for (let index = 0; index < entries.length; index += 1) {
+                const entry = entries[index];
+                setStatus(`正在批量查询 ${index + 1}/${entries.length}：${entry}`, 'working');
+                const answer = await requestAPI(vocabularyPrompt(entry, false), NORMAL_TIMEOUT);
+                results.push(`一、${entry}\n${answer.replace(/^一、[^\n]*\n?/, '')}`);
+            }
+            showResult(entries.join('、'), '批量词汇翻译', results.join('\n\n'));
+            setStatus('批量翻译完成', 'success');
+        } catch (error) {
+            if (isCancelledError(error)) return;
+            if (results.length) {
+                showResult(entries.slice(0, results.length).join('、'), '批量词汇翻译（部分完成）', results.join('\n\n'));
+                setStatus(`批量翻译部分完成：${results.length}/${entries.length}，${error.message}`, 'error');
+            } else {
+                setStatus('批量翻译失败：' + error.message, 'error');
+                showError('批量翻译失败', error.message);
+            }
+        } finally {
+            requestBusy = false;
+        }
+    }
+
+    async function openTranslationDialog() {
+        questionPanel.style.display = 'none';
+        settingsPanel.style.display = 'none';
+        pureTranslationDialog.style.display = 'none';
+        translationDialog.style.display = translationDialog.style.display === 'block' ? 'none' : 'block';
+        document.querySelectorAll('.ai-menu.ai-menu-open').forEach(m => m.classList.remove('ai-menu-open'));
+        openPanel();
+        if (translationDialog.style.display === 'block') {
+            const input = document.getElementById('ai-translation-input');
+            input.value = await getSelectedOrClipboardText();
+            input.focus();
+        }
+    }
+
+    async function askQuestion(forcedQuestion = '') {
+        if (typeof forcedQuestion !== 'string') forcedQuestion = '';
+        if (requestBusy) {
+            setStatus('当前已有请求正在处理中', 'working');
+            return;
+        }
+
+        const input = document.getElementById('ai-question-input');
+        const question = forcedQuestion || input.value.trim();
+        if (!question) {
+            setStatus('请输入英语问题', 'error');
+            input.focus();
+            return;
+        }
+
+        requestBusy = true;
+        questionPanel.style.display = 'none';
+        openPanel();
+        setStatus('正在回答英语问题…', 'working');
+        content.innerHTML = '<div class="ai-card"><div class="ai-label">英语提问</div><div class="ai-text">正在思考并生成回答…</div></div>';
+
+        lastRequest = () => askQuestion(question);
+        try {
+            const result = await requestAPI(conversationPrompt(questionHistory, question), NORMAL_TIMEOUT);
+            if (!forcedQuestion) {
+                questionHistory.push({ question, answer: result });
+                if (questionHistory.length > MAX_QUESTION_TURNS) {
+                    questionHistory = questionHistory.slice(-MAX_QUESTION_TURNS);
+                }
+                saveQuestionHistory();
+            }
+            showResult(question, '英语问题回答', result);
+            setStatus('回答完成', 'success');
+            input.value = '';
+        } catch (error) {
+            if (isCancelledError(error)) return;
+            setStatus('提问失败：' + error.message, 'error');
+            showError('提问失败', error.message);
+        } finally {
+            requestBusy = false;
+        }
+    }
+
+    // =========================================================
+    // API 设置
+    // =========================================================
+
+    document
+        .getElementById(
+            'ai-settings-btn'
+        )
+        .addEventListener(
+            'click',
+            event => {
+
+                event.stopPropagation();
+
+                const config =
+                    getConfig();
+
+                document
+                    .getElementById(
+                        'ai-api-key'
+                    )
+                    .value =
+                    config.apiKey;
+
+                document
+                    .getElementById(
+                        'ai-base-url'
+                    )
+                    .value =
+                    config.baseUrl;
+
+                document
+                    .getElementById(
+                        'ai-model'
+                    )
+                    .value =
+                    config.model;
+
+                settingsPanel
+                    .style
+                    .display =
+                    'block';
+
+                questionPanel.style.display = 'none';
+                translationDialog.style.display = 'none';
+                pureTranslationDialog.style.display = 'none';
+
+                openPanel();
+            }
+        );
+
+    document
+        .getElementById(
+            'ai-cancel'
+        )
+        .addEventListener(
+            'click',
+            () => {
+                settingsPanel
+                    .style
+                    .display =
+                    'none';
+            }
+        );
+
+    document
+        .getElementById(
+            'ai-save'
+        )
+        .addEventListener(
+            'click',
+            () => {
+
+                const apiKey =
+                    document
+                        .getElementById(
+                            'ai-api-key'
+                        )
+                        .value;
+
+                const baseUrl =
+                    document
+                        .getElementById(
+                            'ai-base-url'
+                        )
+                        .value;
+
+                const model =
+                    document
+                        .getElementById(
+                            'ai-model'
+                        )
+                        .value;
+
+                if (!apiKey.trim()) {
+                    setStatus(
+                        'API Key 不能为空',
+                        'error'
+                    );
+                    return;
+                }
+
+                saveConfig(
+                    apiKey,
+                    baseUrl,
+                    model
+                );
+
+                settingsPanel
+                    .style
+                    .display =
+                    'none';
+
+                setStatus(
+                    'API 设置已保存',
+                    'success'
+                );
+            }
+        );
+
+    // =========================================================
+    // 按钮
+    // =========================================================
+
+    document
+        .getElementById(
+            'ai-translate'
+        )
+        .addEventListener(
+            'click',
+            openTranslationDialog
+        );
+
+    function on(id, event, handler, options) {
+        const el = document.getElementById(id);
+        if (el) el.addEventListener(event, handler, options);
+    }
+
+    document.getElementById('ai-pure-translate-btn').addEventListener('click', event => {
+        event.stopPropagation();
+        openPureTranslationDialog();
+    });
+
+    document.getElementById('ai-pure-translation-cancel').addEventListener('click', () => {
+        pureTranslationDialog.style.display = 'none';
+    });
+
+    document.getElementById('ai-pure-translation-paste').addEventListener('click', async () => {
+        try {
+            const text = (await navigator.clipboard.readText()).trim();
+            if (!text) {
+                setStatus('剪贴板中没有文本', 'error');
+                return;
+            }
+            document.getElementById('ai-pure-translation-input').value = text;
+            setStatus('已粘贴剪贴板内容', 'success');
+        } catch {
+            setStatus('无法读取剪贴板，请检查浏览器权限', 'error');
+        }
+    });
+
+    function submitPureTranslation() {
+        const input = document.getElementById('ai-pure-translation-input');
+        const text = input.value.trim();
+        if (!text) {
+            setStatus('请输入或粘贴需要翻译的内容', 'error');
+            input.focus();
+            return;
+        }
+        pureTranslationDialog.style.display = 'none';
+        pureTranslateText(text);
+    }
+
+    on('ai-pure-translation-submit', 'click', submitPureTranslation);
+    document.getElementById('ai-pure-translation-input').addEventListener('keydown', event => {
+        if ((event.ctrlKey || event.metaKey) && event.key === 'Enter') {
+            event.preventDefault();
+            submitPureTranslation();
+        }
+    });
+
+    document.getElementById('ai-translation-cancel').addEventListener('click', () => {
+        translationDialog.style.display = 'none';
+    });
+
+    document.getElementById('ai-translation-paste').addEventListener('click', async () => {
+        try {
+            const text = await navigator.clipboard.readText();
+            if (!text.trim()) {
+                setStatus('剪贴板中没有文本', 'error');
+                return;
+            }
+            document.getElementById('ai-translation-input').value = text.trim();
+            updateFavoriteButton();
+            setStatus('已粘贴剪贴板内容', 'success');
+        } catch {
+            setStatus('无法读取剪贴板，请检查浏览器权限', 'error');
+        }
+    });
+
+    document.getElementById('ai-translation-speak').addEventListener('click', () => {
+        speakVocabulary(document.getElementById('ai-translation-input').value.trim());
+    });
+
+    document.getElementById('ai-translation-favorite').addEventListener('click', () => {
+        toggleVocabularyFavorite(document.getElementById('ai-translation-input').value);
+    });
+
+    on('ai-translation-batch', 'click', batchTranslateVocabulary);
+    on('ai-translation-favorites', 'click', showVocabularyFavorites);
+    on('ai-translation-input', 'input', updateFavoriteButton);
+
+    function submitVocabularyTranslation(detail = false) {
+        const input = document.getElementById('ai-translation-input');
+        const text = input.value.trim();
+        if (!text) {
+            setStatus('请输入或粘贴需要查询的单词或短语', 'error');
+            input.focus();
+            return;
+        }
+        translationDialog.style.display = 'none';
+        translateText(text, detail);
+    }
+
+    document.getElementById('ai-translation-submit').addEventListener('click', () => {
+        submitVocabularyTranslation(false);
+    });
+
+    document.getElementById('ai-translation-detail').addEventListener('click', () => {
+        submitVocabularyTranslation(true);
+    });
+
+    document.getElementById('ai-translation-input').addEventListener('keydown', event => {
+        if ((event.ctrlKey || event.metaKey) && event.key === 'Enter') {
+            event.preventDefault();
+            submitVocabularyTranslation(false);
+        }
+    });
+
+    document
+        .getElementById(
+            'ai-quick-analysis'
+        )
+        .addEventListener(
+            'click',
+            () => quickAnalyze()
+        );
+
+    document
+        .getElementById(
+            'ai-analysis'
+        )
+        .addEventListener(
+            'click',
+            () => detailedAnalyze()
+        );
+
+    document.getElementById('ai-question-btn').addEventListener('click', event => {
+        event.stopPropagation();
+        settingsPanel.style.display = 'none';
+        translationDialog.style.display = 'none';
+        pureTranslationDialog.style.display = 'none';
+        questionPanel.style.display = questionPanel.style.display === 'block' ? 'none' : 'block';
+        document.querySelectorAll('.ai-menu.ai-menu-open').forEach(m => m.classList.remove('ai-menu-open'));
+        openPanel();
+        if (questionPanel.style.display === 'block') {
+            document.querySelector('.ai-question-title').textContent = questionHistory.length ? `？ 继续追问（已进行 ${questionHistory.length} 轮）` : '？ 英语提问';
+            document.getElementById('ai-question-input').focus();
+        }
+    });
+
+    document.getElementById('ai-question-new').addEventListener('click', () => {
+        questionHistory = [];
+        saveQuestionHistory();
+        document.getElementById('ai-question-input').value = '';
+        document.querySelector('.ai-question-title').textContent = '？ 英语提问';
+        setStatus('已新建英语对话', 'success');
+    });
+
+    document.getElementById('ai-question-cancel').addEventListener('click', () => {
+        questionPanel.style.display = 'none';
+    });
+
+    on('ai-question-submit', 'click', () => askQuestion());
+    document.getElementById('ai-question-input').addEventListener('keydown', event => {
+        if ((event.ctrlKey || event.metaKey) && event.key === 'Enter') {
+            event.preventDefault();
+            askQuestion();
+        }
+    });
+
+    on('ai-article-quick', 'click', () => articleAnalyze(false));
+    on('ai-article-analysis', 'click', () => articleAnalyze(true));
+
+    document
+        .getElementById(
+            'ai-paste'
+        )
+        .addEventListener(
+            'click',
+            readClipboardText
+        );
+
+    // =========================================================
+    // 复制结果
+    // =========================================================
+
+    document
+        .getElementById(
+            'ai-copy'
+        )
+        .addEventListener(
+            'click',
+            async () => {
+
+                if (!lastResult) {
+                    setStatus(
+                        '当前没有结果可复制',
+                        'error'
+                    );
+
+                    return;
+                }
+
+                try {
+                    await navigator
+                        .clipboard
+                        .writeText(
+                            lastResult
+                        );
+
+                    setStatus(
+                        '已复制到剪贴板',
+                        'success'
+                    );
+                } catch {
+                    const textarea =
+                        document
+                            .createElement(
+                                'textarea'
+                            );
+
+                    textarea.value =
+                        lastResult;
+
+                    textarea.style.position =
+                        'fixed';
+
+                    textarea.style.left =
+                        '-9999px';
+
+                    textarea.style.top =
+                        '-9999px';
+
+                    (
+                        document.body ||
+                        document.documentElement
+                    ).appendChild(
+                        textarea
+                    );
+
+                    textarea.focus();
+                    textarea.select();
+
+                    try {
+                        const success =
+                            document.execCommand(
+                                'copy'
+                            );
+
+                        if (success) {
+                            setStatus(
+                                '已复制到剪贴板',
+                                'success'
+                            );
+                        } else {
+                            setStatus(
+                                '复制失败，请手动复制',
+                                'error'
+                            );
+                        }
+                    } catch {
+                        setStatus(
+                            '复制失败，请手动复制',
+                            'error'
+                        );
+                    }
+
+                    textarea.remove();
+                }
+            }
+        );
+
+    // =========================================================
+    // 清空
+    // =========================================================
+
+    document
+        .getElementById(
+            'ai-clear'
+        )
+        .addEventListener(
+            'click',
+            () => {
+
+                if (requestBusy) {
+                    cancelActiveRequest();
+                    requestBusy = false;
+                }
+                currentText = '';
+                clipboardText = '';
+                lastResult = '';
+                lastSelectedText = '';
+                copiedSelectionText = '';
+                clipboardTextLoaded = false;
+                lastRequest = null;
+                document.getElementById('ai-translation-input').value = '';
+                questionHistory = [];
+                saveQuestionHistory();
+                document.getElementById('ai-question-input').value = '';
+
+                content.innerHTML = `
+<div class="ai-card">
+
+    <div class="ai-label">
+        已清空
+    </div>
+
+    <div class="ai-text">
+        点击 ◉，输入或粘贴单词或短语开始翻译。
+    </div>
+
+</div>
+`;
+
+                setStatus(
+                    '准备就绪',
+                    'ready'
+                );
+            }
+        );
+
+    // =========================================================
+    // 窗口变化
+    // =========================================================
+
+    window.addEventListener(
+        'resize',
+        () => {
+
+            if (panel.style.height) {
+                const maxHeight = Math.max(360, window.innerHeight - 16);
+                panel.style.height = `${Math.min(panel.getBoundingClientRect().height, maxHeight)}px`;
+            }
+
+            const rect =
+                container
+                    .getBoundingClientRect();
+
+            const position =
+                setContainerPosition(
+                    rect.left,
+                    rect.top
+                );
+
+            GM_setValue(
+                'translator_ball_x',
+                position.x
+            );
+
+            GM_setValue(
+                'translator_ball_y',
+                position.y
+            );
+
+            if (panelOpen) {
+                updatePanelDirection();
+            }
+        }
+    );
+
+    // =========================================================
+    // 初始化
+    // =========================================================
+
+    setStatus(
+        '准备就绪',
+        'ready'
+    );
+
+})();
